@@ -1,0 +1,20 @@
+# Binary
+cmd
+
+# Go build cache
+*.exe
+*.out
+*.test
+
+# Go workspace
+go.work
+go.work.sum
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
