@@ -20,6 +20,18 @@ Optionally install system-wide:
 sudo cp cmd /usr/local/bin/cmd
 ```
 
+## Startup
+
+When started interactively, cmd runs `~/autoexec.bat` automatically if it exists — just like `AUTOEXEC.BAT` on DOS/Windows. Use it to set environment variables, print a greeting, or configure your environment.
+
+Example `~/autoexec.bat`:
+```bat
+@ECHO OFF
+SET EDITOR=vim
+ECHO Ready.
+ECHO.
+```
+
 ## Usage
 
 **Interactive shell:**

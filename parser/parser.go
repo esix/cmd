@@ -66,6 +66,12 @@ func (p *parser) parseOne() (Statement, error) {
 		cmdName = strings.ToUpper(tok.Value)
 	}
 
+	// ECHO. (with dot, no space) prints a blank line
+	if strings.HasPrefix(cmdName, "ECHO.") {
+		p.consume()
+		return &EchoStatement{Newline: true}, nil
+	}
+
 	switch cmdName {
 	case "ECHO":
 		return p.parseEcho()

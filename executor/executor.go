@@ -168,6 +168,10 @@ func (ex *Executor) execute(stmt parser.Statement) int {
 // --- ECHO ---
 
 func (ex *Executor) execEcho(s *parser.EchoStatement) int {
+	if s.Newline {
+		fmt.Println()
+		return 0
+	}
 	if s.TurnOn != nil {
 		ex.env.Echo = *s.TurnOn
 		return 0
