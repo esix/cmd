@@ -9,8 +9,6 @@ import (
 )
 
 // Parse converts a token stream (one logical line) into Statements.
-// A single line typically produces one Statement, but parenthesised
-// blocks can produce compound statements.
 func Parse(tokens []lexer.Token) ([]Statement, error) {
 	p := &parser{tokens: tokens, pos: 0}
 	return p.parseStatements()
@@ -18,7 +16,12 @@ func Parse(tokens []lexer.Token) ([]Statement, error) {
 
 // ParseLine is a convenience wrapper: tokenize + parse in one call.
 func ParseLine(line string) ([]Statement, error) {
-	tokens := lexer.Tokenize(line)
+	return ParseLineWithOpts(line, false)
+}
+
+// ParseLineWithOpts tokenizes with delayed expansion control, then parses.
+func ParseLineWithOpts(line string, delayedExpansion bool) ([]Statement, error) {
+	tokens := lexer.TokenizeWithOpts(line, delayedExpansion)
 	return Parse(tokens)
 }
 
@@ -43,7 +46,12 @@ func (p *parser) consume() lexer.Token {
 func (p *parser) parseStatements() ([]Statement, error) {
 	var stmts []Statement
 	for p.peek().Kind != lexer.EOF {
-		stmt, err := p.parseOne()
+		// Skip & separators between statements
+		if p.peek().Kind == lexer.AMPERSAND {
+			p.consume()
+			continue
+		}
+		stmt, err := p.parseChain()
 		if err != nil {
 			return nil, err
 		}
@@ -54,13 +62,44 @@ func (p *parser) parseStatements() ([]Statement, error) {
 	return stmts, nil
 }
 
+// parseChain handles: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2
+func (p *parser) parseChain() (Statement, error) {
+	left, err := p.parseOne()
+	if err != nil || left == nil {
+		return left, err
+	}
+	for {
+		tok := p.peek()
+		if tok.Kind == lexer.AND || tok.Kind == lexer.OR || tok.Kind == lexer.AMPERSAND {
+			op := tok.Value
+			p.consume()
+			right, err := p.parseOne()
+			if err != nil {
+				return nil, err
+			}
+			if right == nil {
+				break
+			}
+			left = &ChainStatement{Left: left, Op: op, Right: right}
+		} else {
+			break
+		}
+	}
+	return left, nil
+}
+
 func (p *parser) parseOne() (Statement, error) {
 	tok := p.peek()
-	if tok.Kind == lexer.EOF {
+	if tok.Kind == lexer.EOF || tok.Kind == lexer.AMPERSAND ||
+		tok.Kind == lexer.AND || tok.Kind == lexer.OR {
 		return nil, nil
 	}
 
-	// Determine the command name (first WORD token, uppercased)
+	// Block: ( ... )
+	if tok.Kind == lexer.LPAREN {
+		return p.parseBlock()
+	}
+
 	cmdName := ""
 	if tok.Kind == lexer.WORD {
 		cmdName = strings.ToUpper(tok.Value)
@@ -87,9 +126,41 @@ func (p *parser) parseOne() (Statement, error) {
 		return p.parseFor()
 	case "EXIT":
 		return p.parseExit()
+	case "SHIFT":
+		p.consume()
+		return &ShiftStatement{}, nil
+	case "SETLOCAL":
+		return p.parseSetlocal()
+	case "ENDLOCAL":
+		p.consume()
+		return &EndlocalStatement{}, nil
 	default:
 		return p.parseSimpleCommand()
 	}
+}
+
+// --- Block: ( stmt1 & stmt2 & ... ) ---
+
+func (p *parser) parseBlock() (Statement, error) {
+	p.consume() // consume (
+	var stmts []Statement
+	for p.peek().Kind != lexer.RPAREN && p.peek().Kind != lexer.EOF {
+		if p.peek().Kind == lexer.AMPERSAND {
+			p.consume()
+			continue
+		}
+		stmt, err := p.parseChain()
+		if err != nil {
+			return nil, err
+		}
+		if stmt != nil {
+			stmts = append(stmts, stmt)
+		}
+	}
+	if p.peek().Kind == lexer.RPAREN {
+		p.consume()
+	}
+	return &BlockStatement{Stmts: stmts}, nil
 }
 
 // --- ECHO ---
@@ -97,16 +168,10 @@ func (p *parser) parseOne() (Statement, error) {
 func (p *parser) parseEcho() (Statement, error) {
 	p.consume() // consume ECHO
 
-	// ECHO with no args
-	if p.peek().Kind == lexer.EOF {
+	if p.atEnd() {
 		return &EchoStatement{}, nil
 	}
 
-	// Check for ECHO. (blank line) — this arrives as a single WORD "ECHO."
-	// but we already consumed ECHO, so look for a leading dot token.
-	// Actually ECHO. arrives as one token before we split; the lexer sees
-	// "ECHO." as WORD "ECHO." — handled in executor. Here we check the
-	// next token for ON/OFF toggles.
 	next := p.peek()
 	if next.Kind == lexer.WORD {
 		upper := strings.ToUpper(next.Value)
@@ -122,7 +187,6 @@ func (p *parser) parseEcho() (Statement, error) {
 		}
 	}
 
-	// Collect remaining tokens as word groups (one group per token)
 	args := p.collectWordGroups()
 	return &EchoStatement{Args: args}, nil
 }
@@ -132,12 +196,10 @@ func (p *parser) parseEcho() (Statement, error) {
 func (p *parser) parseSet() (Statement, error) {
 	p.consume() // consume SET
 
-	if p.peek().Kind == lexer.EOF {
-		// SET with no args lists all variables — treat as SimpleCommand fallback
+	if p.atEnd() {
 		return &SetStatement{}, nil
 	}
 
-	// Check for /A or /P flags
 	arithmetic := false
 	prompt := false
 	if p.peek().Kind == lexer.WORD {
@@ -151,30 +213,32 @@ func (p *parser) parseSet() (Statement, error) {
 		}
 	}
 
-	// Expect NAME=VALUE as a single WORD token (the lexer keeps = inside words)
-	if p.peek().Kind != lexer.WORD {
+	if p.atEnd() {
 		return &SetStatement{Arithmetic: arithmetic, Prompt: prompt}, nil
 	}
 
 	raw := p.consume().Value
+	// Strip surrounding quotes for SET "name=value" and SET /A "expr"
+	raw = stripQuotes(raw)
+
 	eqIdx := strings.IndexByte(raw, '=')
 	if eqIdx == -1 {
-		// SET VARNAME with no = just prints the variable
 		return &SetStatement{Name: raw, Arithmetic: arithmetic, Prompt: prompt}, nil
 	}
 
 	name := raw[:eqIdx]
 	valueStr := raw[eqIdx+1:]
 
-	// There may be more tokens after the first word (e.g. spaces in value)
-	valueParts := parseWordParts(valueStr)
-	for p.peek().Kind != lexer.EOF {
-		valueParts = append(valueParts, p.collectWordParts()...)
+	var valueGroups [][]WordPart
+	if valueStr != "" {
+		valueGroups = append(valueGroups, parseWordParts(valueStr))
 	}
+	valueGroups = append(valueGroups, p.collectWordGroups()...)
 
 	return &SetStatement{
 		Name:       name,
-		Value:      valueParts,
+		Value:      valueGroups,
+		HasEquals:  true,
 		Arithmetic: arithmetic,
 		Prompt:     prompt,
 	}, nil
@@ -196,7 +260,6 @@ func (p *parser) parseIf() (Statement, error) {
 		return nil, err
 	}
 
-	// Parse THEN body — everything up to optional ELSE
 	then, elseStmts, err := p.parseIfBody()
 	if err != nil {
 		return nil, err
@@ -205,20 +268,23 @@ func (p *parser) parseIf() (Statement, error) {
 	return &IfStatement{Not: not, Condition: cond, Then: then, Else: elseStmts}, nil
 }
 
+var numericOps = map[string]bool{
+	"EQU": true, "NEQ": true, "LSS": true,
+	"LEQ": true, "GTR": true, "GEQ": true,
+}
+
 func (p *parser) parseCondition() (Condition, error) {
 	tok := p.peek()
 
 	if tok.Kind == lexer.WORD {
 		upper := strings.ToUpper(tok.Value)
 
-		// IF EXIST path
 		if upper == "EXIST" {
 			p.consume()
 			path := p.collectWordParts()
 			return &ExistCondition{Path: path}, nil
 		}
 
-		// IF ERRORLEVEL N
 		if upper == "ERRORLEVEL" {
 			p.consume()
 			nStr := p.consume().Value
@@ -227,8 +293,7 @@ func (p *parser) parseCondition() (Condition, error) {
 		}
 	}
 
-	// IF "left"=="right" — the == may be embedded inside a single WORD token
-	// (e.g. `"hello"=="world"`) or split across two tokens (`"hello"==` `"world"`).
+	// Try embedded "==" in a single token: "val1"=="val2"
 	tok = p.peek()
 	if tok.Kind == lexer.WORD {
 		idx := strings.Index(tok.Value, "==")
@@ -236,80 +301,117 @@ func (p *parser) parseCondition() (Condition, error) {
 			p.consume()
 			left := parseWordParts(tok.Value[:idx])
 			right := parseWordParts(tok.Value[idx+2:])
-			// Only collect more tokens if right side was empty in this token
-			// (e.g. format: "val"==  nexttoken)
 			if len(right) == 0 {
 				right = append(right, p.collectWordParts()...)
 			}
 			return &StringCompare{Left: left, Op: "==", Right: right}, nil
 		}
 	}
-	// Fallback: collect left tokens until a token ending with ==
-	left := p.collectUntilOp("==")
+
+	// Collect left operand (one word/token group for numeric ops)
+	left := p.collectOneWordParts()
+
+	// Check for numeric comparison operator: val1 LSS val2
+	if p.peek().Kind == lexer.WORD {
+		op := strings.ToUpper(p.peek().Value)
+		if numericOps[op] {
+			p.consume()
+			right := p.collectOneWordParts()
+			return &NumericCompare{Left: left, Op: op, Right: right}, nil
+		}
+	}
+
+	// Check for == as separate token or suffix
+	if p.peek().Kind == lexer.WORD && strings.HasPrefix(p.peek().Value, "==") {
+		tok := p.consume()
+		rightStr := tok.Value[2:]
+		right := parseWordParts(rightStr)
+		if len(right) == 0 {
+			right = p.collectOneWordParts()
+		}
+		return &StringCompare{Left: left, Op: "==", Right: right}, nil
+	}
+
+	// Fallback: collect until ==
+	more := p.collectUntilOp("==")
+	left = append(left, more...)
 	right := p.collectWordParts()
 	return &StringCompare{Left: left, Op: "==", Right: right}, nil
 }
 
-// collectUntilOp collects word parts until it finds a token ending with op.
-func (p *parser) collectUntilOp(op string) []WordPart {
-	var parts []WordPart
-	for p.peek().Kind != lexer.EOF {
-		tok := p.peek()
-		if tok.Kind == lexer.WORD && strings.HasSuffix(tok.Value, op) {
-			// strip the operator suffix and add the rest as a literal
-			text := tok.Value[:len(tok.Value)-len(op)]
-			p.consume()
-			if text != "" {
-				parts = append(parts, parseWordParts(text)...)
-			}
-			return parts
-		}
-		p.consume()
-		parts = append(parts, parseWordParts(tok.Value)...)
-	}
-	return parts
-}
-
 func (p *parser) parseIfBody() (then []Statement, elseStmts []Statement, err error) {
-	// Simple single-command THEN (no parentheses for now)
-	thenStmt, err := p.parseOne()
-	if err != nil {
-		return nil, nil, err
-	}
-	if thenStmt != nil {
-		then = append(then, thenStmt)
+	// Block body: IF cond ( ... ) ELSE ( ... )
+	if p.peek().Kind == lexer.LPAREN {
+		block, err := p.parseBlock()
+		if err != nil {
+			return nil, nil, err
+		}
+		then = block.(*BlockStatement).Stmts
+	} else {
+		thenStmt, err := p.parseOne()
+		if err != nil {
+			return nil, nil, err
+		}
+		if thenStmt != nil {
+			then = append(then, thenStmt)
+		}
 	}
 
 	// Optional ELSE
 	if p.peek().Kind == lexer.WORD && strings.ToUpper(p.peek().Value) == "ELSE" {
 		p.consume()
-		elseStmt, err := p.parseOne()
-		if err != nil {
-			return nil, nil, err
-		}
-		if elseStmt != nil {
-			elseStmts = append(elseStmts, elseStmt)
+		if p.peek().Kind == lexer.LPAREN {
+			block, err := p.parseBlock()
+			if err != nil {
+				return nil, nil, err
+			}
+			elseStmts = block.(*BlockStatement).Stmts
+		} else {
+			elseStmt, err := p.parseOne()
+			if err != nil {
+				return nil, nil, err
+			}
+			if elseStmt != nil {
+				elseStmts = append(elseStmts, elseStmt)
+			}
 		}
 	}
 
 	return then, elseStmts, nil
 }
 
+// --- SETLOCAL ---
+
+func (p *parser) parseSetlocal() (Statement, error) {
+	p.consume()
+	stmt := &SetlocalStatement{}
+	for p.peek().Kind == lexer.WORD {
+		arg := strings.ToUpper(p.peek().Value)
+		if arg == "ENABLEDELAYEDEXPANSION" {
+			stmt.EnableDelayedExpansion = true
+			p.consume()
+		} else if arg == "DISABLEDELAYEDEXPANSION" {
+			stmt.DisableDelayedExpansion = true
+			p.consume()
+		} else {
+			break
+		}
+	}
+	return stmt, nil
+}
+
 // --- GOTO ---
 
 func (p *parser) parseGoto() (Statement, error) {
-	p.consume() // consume GOTO
-	label := ""
-	if p.peek().Kind == lexer.WORD {
-		label = p.consume().Value
-	}
-	return &GotoStatement{Label: label}, nil
+	p.consume()
+	parts := p.collectWordParts()
+	return &GotoStatement{LabelParts: parts}, nil
 }
 
 // --- CALL ---
 
 func (p *parser) parseCall() (Statement, error) {
-	p.consume() // consume CALL
+	p.consume()
 	args := p.collectWordParts()
 	return &CallStatement{Args: args}, nil
 }
@@ -317,12 +419,11 @@ func (p *parser) parseCall() (Statement, error) {
 // --- FOR ---
 
 func (p *parser) parseFor() (Statement, error) {
-	p.consume() // consume FOR
+	p.consume()
 
 	kind := ForInList
 	options := ""
 
-	// Check for /L or /F flags
 	if p.peek().Kind == lexer.WORD {
 		flag := strings.ToUpper(p.peek().Value)
 		if flag == "/L" {
@@ -337,27 +438,24 @@ func (p *parser) parseFor() (Statement, error) {
 		}
 	}
 
-	// %%I or %I variable
 	varName := ""
 	if p.peek().Kind == lexer.PERCENT_VAR {
 		raw := p.consume().Value
-		// strip % signs: %I -> I, %%I -> I
 		varName = strings.Trim(raw, "%")
 	}
 
-	// IN
 	if p.peek().Kind == lexer.WORD && strings.ToUpper(p.peek().Value) == "IN" {
 		p.consume()
 	}
 
-	// (items) — items may be space-separated or comma-separated (FOR /L)
 	var items []string
 	if p.peek().Kind == lexer.LPAREN {
 		p.consume()
 		for p.peek().Kind != lexer.RPAREN && p.peek().Kind != lexer.EOF {
 			tok := p.consume()
-			if tok.Kind == lexer.WORD {
-				for _, part := range strings.Split(tok.Value, ",") {
+			val := tok.Value
+			if tok.Kind == lexer.WORD || tok.Kind == lexer.PERCENT_VAR || tok.Kind == lexer.BANG_VAR {
+				for _, part := range strings.Split(val, ",") {
 					part = strings.TrimSpace(part)
 					if part != "" {
 						items = append(items, part)
@@ -370,18 +468,26 @@ func (p *parser) parseFor() (Statement, error) {
 		}
 	}
 
-	// DO
 	if p.peek().Kind == lexer.WORD && strings.ToUpper(p.peek().Value) == "DO" {
 		p.consume()
 	}
 
-	body, err := p.parseOne()
-	if err != nil {
-		return nil, err
-	}
+	// DO body can be a single command or a ( block )
 	var bodyStmts []Statement
-	if body != nil {
-		bodyStmts = append(bodyStmts, body)
+	if p.peek().Kind == lexer.LPAREN {
+		block, err := p.parseBlock()
+		if err != nil {
+			return nil, err
+		}
+		bodyStmts = block.(*BlockStatement).Stmts
+	} else {
+		body, err := p.parseOne()
+		if err != nil {
+			return nil, err
+		}
+		if body != nil {
+			bodyStmts = append(bodyStmts, body)
+		}
 	}
 
 	return &ForStatement{
@@ -396,7 +502,7 @@ func (p *parser) parseFor() (Statement, error) {
 // --- EXIT ---
 
 func (p *parser) parseExit() (Statement, error) {
-	p.consume() // consume EXIT
+	p.consume()
 	subOnly := false
 	code := 0
 
@@ -422,7 +528,7 @@ func (p *parser) parseSimpleCommand() (Statement, error) {
 	var args []WordPart
 	var redirects []Redirect
 
-	for p.peek().Kind != lexer.EOF {
+	for !p.atEnd() {
 		tok := p.peek()
 
 		if tok.Kind == lexer.REDIRECTION {
@@ -435,13 +541,20 @@ func (p *parser) parseSimpleCommand() (Statement, error) {
 			continue
 		}
 
-		// Stop at pipeline / conditional operators
-		if tok.Kind == lexer.PIPE || tok.Kind == lexer.AND || tok.Kind == lexer.OR {
+		if tok.Kind == lexer.RPAREN {
 			break
 		}
 
 		p.consume()
-		args = append(args, parseWordParts(tok.Value)...)
+		switch tok.Kind {
+		case lexer.PERCENT_VAR:
+			args = append(args, varPartFromToken(tok.Value))
+		case lexer.BANG_VAR:
+			name := strings.Trim(tok.Value, "!")
+			args = append(args, &DelayedVarPart{Name: name})
+		default:
+			args = append(args, parseWordParts(tok.Value)...)
+		}
 	}
 
 	return &SimpleCommand{Args: args, Redirects: redirects}, nil
@@ -449,57 +562,99 @@ func (p *parser) parseSimpleCommand() (Statement, error) {
 
 // --- Helpers ---
 
+// atEnd returns true if the next token ends the current statement.
+func (p *parser) atEnd() bool {
+	k := p.peek().Kind
+	return k == lexer.EOF || k == lexer.AMPERSAND ||
+		k == lexer.AND || k == lexer.OR || k == lexer.RPAREN
+}
+
 // collectWordGroups drains remaining non-control tokens into word groups.
-// Each token becomes one group; groups are joined with spaces during execution.
+// Adjacent tokens (no whitespace between them) are merged into the same group.
 func (p *parser) collectWordGroups() [][]WordPart {
 	var groups [][]WordPart
-	for {
+	for !p.atEnd() {
 		tok := p.peek()
-		if tok.Kind == lexer.EOF || tok.Kind == lexer.PIPE ||
-			tok.Kind == lexer.AND || tok.Kind == lexer.OR {
+		if tok.Kind == lexer.PIPE || tok.Kind == lexer.REDIRECTION {
 			break
 		}
 		p.consume()
-		var parts []WordPart
-		switch tok.Kind {
-		case lexer.PERCENT_VAR:
-			parts = []WordPart{varPartFromToken(tok.Value)}
-		case lexer.BANG_VAR:
-			name := strings.Trim(tok.Value, "!")
-			parts = []WordPart{&VarPart{Name: name, Positional: -1}}
-		default:
-			parts = parseWordParts(tok.Value)
+		parts := tokenToParts(tok)
+		if !tok.SpaceBefore && len(groups) > 0 {
+			groups[len(groups)-1] = append(groups[len(groups)-1], parts...)
+		} else {
+			groups = append(groups, parts)
 		}
-		groups = append(groups, parts)
 	}
 	return groups
 }
 
-// collectWordParts drains remaining non-control tokens into WordParts.
+// collectWordParts drains remaining non-control tokens into a flat WordPart slice.
 func (p *parser) collectWordParts() []WordPart {
 	var parts []WordPart
-	for {
+	for !p.atEnd() {
 		tok := p.peek()
-		if tok.Kind == lexer.EOF || tok.Kind == lexer.PIPE ||
-			tok.Kind == lexer.AND || tok.Kind == lexer.OR {
+		if tok.Kind == lexer.PIPE || tok.Kind == lexer.REDIRECTION {
 			break
 		}
 		p.consume()
-		switch tok.Kind {
-		case lexer.PERCENT_VAR:
-			parts = append(parts, varPartFromToken(tok.Value))
-		case lexer.BANG_VAR:
-			name := strings.Trim(tok.Value, "!")
-			parts = append(parts, &VarPart{Name: name, Positional: -1})
-		default:
-			parts = append(parts, parseWordParts(tok.Value)...)
-		}
+		parts = append(parts, tokenToParts(tok)...)
 	}
 	return parts
 }
 
-// parseWordParts splits a raw string into LiteralParts and VarParts,
-// resolving any %VAR% references embedded in the string.
+// collectOneWordParts collects parts for a single word (stops at space boundary).
+func (p *parser) collectOneWordParts() []WordPart {
+	var parts []WordPart
+	first := true
+	for !p.atEnd() {
+		tok := p.peek()
+		if tok.Kind == lexer.PIPE || tok.Kind == lexer.REDIRECTION {
+			break
+		}
+		if !first && tok.SpaceBefore {
+			break
+		}
+		p.consume()
+		parts = append(parts, tokenToParts(tok)...)
+		first = false
+	}
+	return parts
+}
+
+// collectUntilOp collects word parts until it finds a token ending with op.
+func (p *parser) collectUntilOp(op string) []WordPart {
+	var parts []WordPart
+	for p.peek().Kind != lexer.EOF {
+		tok := p.peek()
+		if tok.Kind == lexer.WORD && strings.HasSuffix(tok.Value, op) {
+			text := tok.Value[:len(tok.Value)-len(op)]
+			p.consume()
+			if text != "" {
+				parts = append(parts, parseWordParts(text)...)
+			}
+			return parts
+		}
+		p.consume()
+		parts = append(parts, parseWordParts(tok.Value)...)
+	}
+	return parts
+}
+
+// tokenToParts converts a token into WordParts.
+func tokenToParts(tok lexer.Token) []WordPart {
+	switch tok.Kind {
+	case lexer.PERCENT_VAR:
+		return []WordPart{varPartFromToken(tok.Value)}
+	case lexer.BANG_VAR:
+		name := strings.Trim(tok.Value, "!")
+		return []WordPart{&DelayedVarPart{Name: name}}
+	default:
+		return parseWordParts(tok.Value)
+	}
+}
+
+// parseWordParts splits a raw string into LiteralParts, VarParts, and TildeVarParts.
 func parseWordParts(s string) []WordPart {
 	if s == "" {
 		return nil
@@ -516,7 +671,34 @@ func parseWordParts(s string) []WordPart {
 		if pct > i {
 			parts = append(parts, &LiteralPart{Text: s[i:pct]})
 		}
-		// Find closing %
+
+		// %~[modifiers]N — tilde parameter reference
+		if pct+1 < len(s) && s[pct+1] == '~' {
+			j := pct + 2
+			for j < len(s) && ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z')) {
+				j++
+			}
+			if j < len(s) && s[j] >= '0' && s[j] <= '9' {
+				mods := s[pct+2 : j]
+				digit := int(s[j] - '0')
+				parts = append(parts, &TildeVarPart{Positional: digit, Modifiers: mods})
+				i = j + 1
+				continue
+			}
+			// Not a valid tilde ref, treat % as literal
+			parts = append(parts, &LiteralPart{Text: "%"})
+			i = pct + 1
+			continue
+		}
+
+		// %N — positional parameter
+		if pct+1 < len(s) && s[pct+1] >= '0' && s[pct+1] <= '9' {
+			digit := int(s[pct+1] - '0')
+			parts = append(parts, &VarPart{Positional: digit})
+			i = pct + 2
+			continue
+		}
+
 		closeIdx := strings.IndexByte(s[pct+1:], '%')
 		if closeIdx == -1 {
 			parts = append(parts, &LiteralPart{Text: "%"})
@@ -526,8 +708,27 @@ func parseWordParts(s string) []WordPart {
 		closeIdx += pct + 1
 		name := s[pct+1 : closeIdx]
 		if name == "" {
-			// %% → literal %
 			parts = append(parts, &LiteralPart{Text: "%"})
+			i = closeIdx + 1
+			continue
+		}
+		// Check for substring: VAR:~N or VAR:~N,M
+		if colonIdx := strings.Index(name, ":~"); colonIdx != -1 {
+			varName := name[:colonIdx]
+			spec := name[colonIdx+2:]
+			start := 0
+			length := 0
+			hasLength := false
+			if commaIdx := strings.IndexByte(spec, ','); commaIdx != -1 {
+				start, _ = strconv.Atoi(spec[:commaIdx])
+				length, _ = strconv.Atoi(spec[commaIdx+1:])
+				hasLength = true
+			} else {
+				start, _ = strconv.Atoi(spec)
+			}
+			parts = append(parts, &SubstringVarPart{
+				Name: varName, Start: start, Length: length, HasLength: hasLength,
+			})
 			i = closeIdx + 1
 			continue
 		}
@@ -538,11 +739,69 @@ func parseWordParts(s string) []WordPart {
 }
 
 func varPartFromToken(raw string) WordPart {
-	// %1 .. %9
+	// %~[modifiers]N — tilde parameter
+	if strings.HasPrefix(raw, "%~") {
+		rest := raw[2:]
+		if len(rest) == 0 {
+			return &LiteralPart{Text: raw}
+		}
+		// Last char should be the digit
+		digit := rest[len(rest)-1]
+		if digit >= '0' && digit <= '9' {
+			mods := rest[:len(rest)-1]
+			return &TildeVarPart{
+				Positional: int(digit - '0'),
+				Modifiers:  mods,
+			}
+		}
+		// Could be %~dp0 style where 0 is embedded
+		return &LiteralPart{Text: raw}
+	}
+
+	// %%I — FOR variable
+	if strings.HasPrefix(raw, "%%") {
+		name := strings.Trim(raw, "%")
+		return &VarPart{Name: name, Positional: -1}
+	}
+
+	// %N — positional
 	if len(raw) == 2 && raw[0] == '%' && raw[1] >= '0' && raw[1] <= '9' {
 		return &VarPart{Positional: int(raw[1] - '0'), Name: ""}
 	}
-	// %VAR%
+
+	// %VAR% or %VAR:~N,M%
 	name := strings.Trim(raw, "%")
+
+	// Check for substring: VAR:~N or VAR:~N,M
+	if colonIdx := strings.Index(name, ":~"); colonIdx != -1 {
+		varName := name[:colonIdx]
+		spec := name[colonIdx+2:]
+		start := 0
+		length := 0
+		hasLength := false
+
+		if commaIdx := strings.IndexByte(spec, ','); commaIdx != -1 {
+			start, _ = strconv.Atoi(spec[:commaIdx])
+			length, _ = strconv.Atoi(spec[commaIdx+1:])
+			hasLength = true
+		} else {
+			start, _ = strconv.Atoi(spec)
+		}
+		return &SubstringVarPart{
+			Name:      varName,
+			Start:     start,
+			Length:    length,
+			HasLength: hasLength,
+		}
+	}
+
 	return &VarPart{Name: name, Positional: -1}
+}
+
+// stripQuotes removes one layer of surrounding double quotes.
+func stripQuotes(s string) string {
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1]
+	}
+	return s
 }

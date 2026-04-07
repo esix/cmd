@@ -19,4 +19,5 @@ var Registry = map[string]Func{
 	"DIR":   Dir,
 	"REM":   Rem,
 	"TYPE":  Type,
+	"SHIFT": func(_ []string, _ *env.Env) int { return 0 }, // handled by executor directly
 }

@@ -2,6 +2,7 @@ package builtins
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strconv"
 	"strings"
@@ -29,13 +30,26 @@ func Set(args []string, e *env.Env) int {
 
 	// SET /A arithmetic
 	if strings.ToUpper(args[0]) == "/A" {
-		expr := strings.Join(args[1:], "")
+		raw := strings.Join(args[1:], "")
+		eqIdx := strings.IndexByte(raw, '=')
+		if eqIdx == -1 {
+			// No assignment, just evaluate and print
+			result, err := evalArith(raw, e)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "SET /A: %v\n", err)
+				return 1
+			}
+			fmt.Println(result)
+			return 0
+		}
+		name := strings.TrimSpace(raw[:eqIdx])
+		expr := strings.TrimSpace(raw[eqIdx+1:])
 		result, err := evalArith(expr, e)
 		if err != nil {
-			fmt.Printf("SET /A: %v\n", err)
+			fmt.Fprintf(os.Stderr, "SET /A: %v\n", err)
 			return 1
 		}
-		fmt.Println(result)
+		e.Set(name, strconv.Itoa(result))
 		return 0
 	}
 

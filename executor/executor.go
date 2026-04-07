@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/esix/cmd/env"
@@ -14,12 +15,20 @@ import (
 	"github.com/esix/cmd/parser"
 )
 
+// scriptLine is a raw line in a .bat file, pre-classified as label or code.
+type scriptLine struct {
+	raw   string // the line text (@ stripped, trimmed)
+	label string // non-empty if this is a :LABEL line (uppercased, without colon)
+}
+
 // Executor runs a list of statements with a program counter (for GOTO support).
 type Executor struct {
 	env        *env.Env
 	positional []string // %0, %1, ... script arguments
-	stmts      []parser.Statement
-	pc         int // current statement index
+	stmts      []parser.Statement // used by RunStmts (interactive / inline)
+	lines      []scriptLine       // used by RunFile (lazy parsing)
+	pc         int                // current line or statement index
+	gotoPending bool              // true when GOTO was executed in a nested context
 }
 
 // New creates an Executor.
@@ -46,7 +55,8 @@ func (ex *Executor) RunLine(line string) int {
 		return 0
 	}
 
-	stmts, err := parser.ParseLine(line)
+	line = expander.ExpandPercent(line, ex.env, ex.positional)
+	stmts, err := parser.ParseLineWithOpts(line, ex.env.DelayedExpansion)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Parse error: %v\n", err)
 		return 1
@@ -59,8 +69,8 @@ func (ex *Executor) RunLine(line string) int {
 	return ex.RunStmts(stmts, nil)
 }
 
-// RunFile executes a .bat file by reading all statements and running them
-// with GOTO support (program counter).
+// RunFile executes a .bat file. Lines are parsed on-the-fly so that
+// SETLOCAL EnableDelayedExpansion takes effect for subsequent lines.
 func (ex *Executor) RunFile(path string, args []string) int {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -69,30 +79,33 @@ func (ex *Executor) RunFile(path string, args []string) int {
 	}
 
 	ex.env.FileMode = true
+	savedPos := ex.positional
 	ex.positional = append([]string{path}, args...)
 
-	lines := strings.Split(string(data), "\n")
-	var stmts []parser.Statement
-
-	for _, line := range lines {
+	// Pre-process lines: classify as label or code, skip blanks and REM
+	rawLines := strings.Split(string(data), "\n")
+	var slines []scriptLine
+	for _, line := range rawLines {
 		line = strings.TrimRight(line, "\r")
-
-		// Skip blank lines
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-
-		// Strip leading @
+		// Strip leading @ (echo suppression marker)
 		if strings.HasPrefix(line, "@") {
 			line = line[1:]
 		}
-
 		trimmed := strings.TrimSpace(line)
 
-		// Label line
+		// Shebang line
+		if strings.HasPrefix(trimmed, "#!") {
+			continue
+		}
+
+		// Label — only first word is the label name, rest is comment
 		if strings.HasPrefix(trimmed, ":") {
-			label := strings.ToUpper(trimmed[1:])
-			stmts = append(stmts, &parser.LabelStatement{Name: label})
+			labelLine := strings.TrimSpace(trimmed[1:])
+			label := strings.Fields(labelLine)[0]
+			slines = append(slines, scriptLine{label: strings.ToUpper(label)})
 			continue
 		}
 
@@ -102,15 +115,48 @@ func (ex *Executor) RunFile(path string, args []string) int {
 			continue
 		}
 
-		parsed, err := parser.ParseLine(line)
+		slines = append(slines, scriptLine{raw: line})
+	}
+
+	// Join multi-line ( ... ) blocks into single lines using & as separator
+	slines = joinBlocks(slines)
+
+	// Execute line-by-line with lazy parsing
+	savedLines := ex.lines
+	savedPC := ex.pc
+	ex.lines = slines
+	ex.pc = 0
+
+	code := 0
+	for ex.pc < len(ex.lines) {
+		sl := ex.lines[ex.pc]
+		ex.pc++
+
+		if sl.label != "" {
+			continue // labels are no-ops during execution
+		}
+
+		// Parse with current delayed expansion state
+		expanded := expander.ExpandPercent(sl.raw, ex.env, ex.positional)
+		stmts, err := parser.ParseLineWithOpts(expanded, ex.env.DelayedExpansion)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "Parse error: %v\n", err)
 			continue
 		}
-		stmts = append(stmts, parsed...)
+		for _, stmt := range stmts {
+			code = ex.execute(stmt)
+			ex.env.ExitCode = code
+			if ex.gotoPending {
+				ex.gotoPending = false // consumed by the file-level loop
+				break
+			}
+		}
 	}
 
-	return ex.RunStmts(stmts, args)
+	ex.lines = savedLines
+	ex.pc = savedPC
+	ex.positional = savedPos
+	return code
 }
 
 // RunStmts executes a slice of statements with GOTO support.
@@ -131,10 +177,15 @@ func (ex *Executor) RunStmts(stmts []parser.Statement, positional []string) int 
 		ex.pc++
 		code = ex.execute(stmt)
 		ex.env.ExitCode = code
+		if ex.gotoPending {
+			break // bubble up GOTO to the file-level loop
+		}
 	}
 
 	ex.stmts = saved
-	ex.pc = savedPC
+	if !ex.gotoPending {
+		ex.pc = savedPC // only restore pc if no GOTO is pending
+	}
 	ex.positional = savedPos
 	return code
 }
@@ -155,14 +206,71 @@ func (ex *Executor) execute(stmt parser.Statement) int {
 		return ex.execFor(s)
 	case *parser.ExitStatement:
 		return ex.execExit(s)
+	case *parser.ShiftStatement:
+		return ex.execShift()
+	case *parser.ChainStatement:
+		return ex.execChain(s)
+	case *parser.BlockStatement:
+		return ex.execBlock(s)
+	case *parser.SetlocalStatement:
+		return ex.execSetlocal(s)
+	case *parser.EndlocalStatement:
+		return ex.execEndlocal()
 	case *parser.LabelStatement:
-		return 0 // labels are no-ops during execution
+		return 0
 	case *parser.SimpleCommand:
 		return ex.execSimple(s)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown statement type: %T\n", stmt)
 		return 1
 	}
+}
+
+// --- CHAIN: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2 ---
+
+func (ex *Executor) execChain(s *parser.ChainStatement) int {
+	leftCode := ex.execute(s.Left)
+	if ex.gotoPending {
+		return leftCode
+	}
+	switch s.Op {
+	case "&":
+		return ex.execute(s.Right)
+	case "&&":
+		if leftCode == 0 {
+			return ex.execute(s.Right)
+		}
+		return leftCode
+	case "||":
+		if leftCode != 0 {
+			return ex.execute(s.Right)
+		}
+		return leftCode
+	}
+	return leftCode
+}
+
+// --- BLOCK: ( stmt1 & stmt2 & ... ) ---
+
+func (ex *Executor) execBlock(s *parser.BlockStatement) int {
+	code := 0
+	for _, stmt := range s.Stmts {
+		code = ex.execute(stmt)
+		ex.env.ExitCode = code
+		if ex.gotoPending {
+			break
+		}
+	}
+	return code
+}
+
+// --- SHIFT ---
+
+func (ex *Executor) execShift() int {
+	if len(ex.positional) > 1 {
+		ex.positional = ex.positional[1:]
+	}
+	return 0
 }
 
 // --- ECHO ---
@@ -189,7 +297,22 @@ func (ex *Executor) execSet(s *parser.SetStatement) int {
 	if s.Name == "" {
 		return builtins.Set(nil, ex.env)
 	}
-	value := ex.expandParts(s.Value)
+	// Expand each word group and join with spaces
+	words := make([]string, 0, len(s.Value))
+	for _, group := range s.Value {
+		words = append(words, ex.expandParts(group))
+	}
+	value := strings.Join(words, " ")
+
+	if s.Arithmetic {
+		// SET /A: evaluate as integer arithmetic
+		return builtins.Set([]string{"/A", s.Name + "=" + value}, ex.env)
+	}
+
+	if !s.HasEquals {
+		// SET NAME without = → display the variable
+		return builtins.Set([]string{s.Name}, ex.env)
+	}
 	if value == "" {
 		ex.env.Unset(s.Name)
 	} else {
@@ -220,6 +343,26 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 		right := stripOuterQuotes(ex.expandParts(c.Right))
 		return left == right
 
+	case *parser.NumericCompare:
+		left := stripOuterQuotes(ex.expandParts(c.Left))
+		right := stripOuterQuotes(ex.expandParts(c.Right))
+		l, _ := strconv.Atoi(strings.TrimSpace(left))
+		r, _ := strconv.Atoi(strings.TrimSpace(right))
+		switch c.Op {
+		case "EQU":
+			return l == r
+		case "NEQ":
+			return l != r
+		case "LSS":
+			return l < r
+		case "LEQ":
+			return l <= r
+		case "GTR":
+			return l > r
+		case "GEQ":
+			return l >= r
+		}
+
 	case *parser.ExistCondition:
 		path := ex.expandParts(c.Path)
 		_, err := os.Stat(path)
@@ -234,7 +377,38 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 // --- GOTO ---
 
 func (ex *Executor) execGoto(s *parser.GotoStatement) int {
-	label := strings.ToUpper(s.Label)
+	var raw string
+	if len(s.LabelParts) > 0 {
+		raw = ex.expandParts(s.LabelParts)
+	} else {
+		raw = s.Label
+	}
+	label := strings.ToUpper(strings.TrimPrefix(raw, ":"))
+
+	// GOTO :EOF — jump past end (exit script/subroutine)
+	if label == "EOF" {
+		if ex.lines != nil {
+			ex.pc = len(ex.lines)
+		} else {
+			ex.pc = len(ex.stmts)
+		}
+		return 0
+	}
+
+	// Search in file lines (lazy-parse mode)
+	if ex.lines != nil {
+		for i, sl := range ex.lines {
+			if sl.label == label {
+				ex.pc = i + 1
+				ex.gotoPending = true // signal RunStmts to break out
+				return 0
+			}
+		}
+		fmt.Fprintf(os.Stderr, "Label not found: %s\n", s.Label)
+		return 1
+	}
+
+	// Search in pre-parsed statements (interactive/RunStmts mode)
 	for i, stmt := range ex.stmts {
 		if lbl, ok := stmt.(*parser.LabelStatement); ok {
 			if lbl.Name == label {
@@ -255,28 +429,82 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 	}
 	first := ex.expandParts([]parser.WordPart{s.Args[0]})
 
+	// Expand remaining args as positional params for the call
+	var callArgs []string
+	callArgs = append(callArgs, first) // %0 = label or script name
+	for _, arg := range s.Args[1:] {
+		callArgs = append(callArgs, ex.expandParts([]parser.WordPart{arg}))
+	}
+
 	// CALL :label — subroutine within same file
 	if strings.HasPrefix(first, ":") {
 		label := strings.ToUpper(first[1:])
 		savedPC := ex.pc
-		for i, stmt := range ex.stmts {
-			if lbl, ok := stmt.(*parser.LabelStatement); ok && lbl.Name == label {
-				ex.pc = i + 1
-				// Run until EXIT /B or end
-				code := 0
-				for ex.pc < len(ex.stmts) {
-					stmt := ex.stmts[ex.pc]
-					ex.pc++
-					if exitStmt, ok := stmt.(*parser.ExitStatement); ok && exitStmt.SubOnly {
-						code = exitStmt.Code
-						break
+		savedPos := ex.positional
+		ex.positional = callArgs
+
+		if ex.lines != nil {
+			for i, sl := range ex.lines {
+				if sl.label == label {
+					ex.pc = i + 1
+					code := 0
+					for ex.pc < len(ex.lines) {
+						sl := ex.lines[ex.pc]
+						ex.pc++
+						if sl.label != "" {
+							continue
+						}
+						expanded := expander.ExpandPercent(sl.raw, ex.env, ex.positional)
+		stmts, err := parser.ParseLineWithOpts(expanded, ex.env.DelayedExpansion)
+						if err != nil {
+							continue
+						}
+						done := false
+						for _, stmt := range stmts {
+							if exitStmt, ok := stmt.(*parser.ExitStatement); ok && exitStmt.SubOnly {
+								code = exitStmt.Code
+								done = true
+								break
+							}
+							code = ex.execute(stmt)
+							if ex.gotoPending {
+								break
+							}
+						}
+						if done {
+							break
+						}
+						if ex.gotoPending {
+							ex.gotoPending = false // GOTO within subroutine
+							continue               // resume from new PC
+						}
 					}
-					code = ex.execute(stmt)
+					ex.pc = savedPC
+					ex.positional = savedPos
+					return code
 				}
-				ex.pc = savedPC
-				return code
+			}
+		} else {
+			for i, stmt := range ex.stmts {
+				if lbl, ok := stmt.(*parser.LabelStatement); ok && lbl.Name == label {
+					ex.pc = i + 1
+					code := 0
+					for ex.pc < len(ex.stmts) {
+						stmt := ex.stmts[ex.pc]
+						ex.pc++
+						if exitStmt, ok := stmt.(*parser.ExitStatement); ok && exitStmt.SubOnly {
+							code = exitStmt.Code
+							break
+						}
+						code = ex.execute(stmt)
+					}
+					ex.pc = savedPC
+					ex.positional = savedPos
+					return code
+				}
 			}
 		}
+		ex.positional = savedPos
 		fmt.Fprintf(os.Stderr, "Label not found: %s\n", first)
 		return 1
 	}
@@ -347,12 +575,37 @@ func (ex *Executor) execForInList(s *parser.ForStatement) int {
 	return code
 }
 
+// --- SETLOCAL / ENDLOCAL ---
+
+func (ex *Executor) execSetlocal(s *parser.SetlocalStatement) int {
+	ex.env.Push()
+	if s.EnableDelayedExpansion {
+		ex.env.DelayedExpansion = true
+	}
+	if s.DisableDelayedExpansion {
+		ex.env.DelayedExpansion = false
+	}
+	return 0
+}
+
+func (ex *Executor) execEndlocal() int {
+	if !ex.env.Pop() {
+		fmt.Fprintln(os.Stderr, "ENDLOCAL without matching SETLOCAL")
+	}
+	return 0
+}
+
 // --- EXIT ---
 
 func (ex *Executor) execExit(s *parser.ExitStatement) int {
 	if s.SubOnly {
-		// EXIT /B: signal to RunStmts to stop — set pc past end
-		ex.pc = len(ex.stmts)
+		// EXIT /B: signal to stop — set pc past end of whichever loop is active
+		if ex.lines != nil {
+			ex.pc = len(ex.lines)
+		}
+		if ex.stmts != nil {
+			ex.pc = len(ex.stmts)
+		}
 		return s.Code
 	}
 	os.Exit(s.Code)
@@ -421,6 +674,55 @@ func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int 
 		return 1
 	}
 	return 0
+}
+
+// joinBlocks merges multi-line parenthesized blocks into single lines.
+// e.g. "if cond (\n  cmd1\n  cmd2\n)" becomes "if cond ( cmd1 & cmd2 )"
+func joinBlocks(lines []scriptLine) []scriptLine {
+	var result []scriptLine
+	depth := 0
+	var accum string
+
+	for _, sl := range lines {
+		if sl.label != "" {
+			if depth > 0 {
+				// Label inside a block: flush the block and add the label
+				result = append(result, scriptLine{raw: accum})
+				accum = ""
+				depth = 0
+			}
+			result = append(result, sl)
+			continue
+		}
+
+		line := sl.raw
+		opens := strings.Count(line, "(") - strings.Count(line, ")")
+
+		if depth == 0 && opens <= 0 {
+			result = append(result, sl)
+			continue
+		}
+
+		if depth == 0 {
+			accum = line
+			depth += opens
+		} else {
+			accum += " & " + strings.TrimSpace(line)
+			depth += opens
+		}
+
+		if depth <= 0 {
+			result = append(result, scriptLine{raw: accum})
+			accum = ""
+			depth = 0
+		}
+	}
+
+	if accum != "" {
+		result = append(result, scriptLine{raw: accum})
+	}
+
+	return result
 }
 
 // resolveBat checks if name refers to a .bat file (with or without extension).

@@ -130,6 +130,17 @@ ECHO world >> out.txt
 cmd /c somecmd 2>&1
 ```
 
+### Delayed expansion
+
+```bat
+SETLOCAL EnableDelayedExpansion
+SET RESULT=start
+FOR /L %%I IN (1,1,5) DO SET RESULT=!RESULT!-%%I
+ECHO %RESULT%     REM shows "start" (expanded at parse time)
+ECHO !RESULT!     REM shows "start-1-2-3-4-5" (expanded at run time)
+ENDLOCAL
+```
+
 ### Echo control
 
 ```bat
@@ -157,6 +168,8 @@ ECHO.              REM print blank line
 | `CLS` | Clear screen |
 | `PAUSE` | Wait for keypress |
 | `TYPE file [file2...]` | Print file contents to screen |
+| `SETLOCAL [EnableDelayedExpansion]` | Push environment scope. `!VAR!` resolves at run time. |
+| `ENDLOCAL` | Pop environment scope (restores variables and delayed expansion state) |
 | `REM` | Comment |
 
 Any command not matched as a builtin or `.bat` file is executed as a system command.
@@ -167,7 +180,6 @@ Any command not matched as a builtin or `.bat` file is executed as a system comm
 - **Case-sensitive filenames.** The underlying Linux filesystem is case-sensitive even though BAT commands are not.
 - **`%%I` vs `%I` in FOR.** Use `%%I` in `.bat` files (same as Windows). The REPL accepts both.
 - **No `%CD%`, `%DATE%`, `%TIME%` magic variables** yet — use `pwd`, `date` etc. as external commands.
-- **Delayed expansion (`!VAR!`)** is parsed but off by default. `SETLOCAL EnableDelayedExpansion` is not yet implemented.
 - **Pipes (`|`) and `&&` / `||`** are recognized by the lexer but not yet executed.
 
 ## Project Structure

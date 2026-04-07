@@ -22,6 +22,24 @@ type Redirect struct {
 	File string
 }
 
+// --- Chain: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2 ---
+
+type ChainStatement struct {
+	Left  Statement
+	Op    string // "&&", "||", or "&"
+	Right Statement
+}
+
+func (*ChainStatement) statementNode() {}
+
+// --- Block: ( stmt1 & stmt2 & ... ) ---
+
+type BlockStatement struct {
+	Stmts []Statement
+}
+
+func (*BlockStatement) statementNode() {}
+
 // --- IF ---
 
 type IfStatement struct {
@@ -44,6 +62,15 @@ type StringCompare struct {
 
 func (*StringCompare) conditionNode() {}
 
+// NumericCompare handles: IF val1 LSS val2, IF val1 GTR val2, etc.
+type NumericCompare struct {
+	Left  []WordPart
+	Op    string // "EQU", "NEQ", "LSS", "LEQ", "GTR", "GEQ"
+	Right []WordPart
+}
+
+func (*NumericCompare) conditionNode() {}
+
 type ExistCondition struct{ Path []WordPart }
 
 func (*ExistCondition) conditionNode() {}
@@ -54,7 +81,10 @@ func (*ErrorlevelCondition) conditionNode() {}
 
 // --- GOTO ---
 
-type GotoStatement struct{ Label string }
+type GotoStatement struct {
+	Label     string     // static label (if known)
+	LabelParts []WordPart // dynamic label (expanded at execution time)
+}
 
 func (*GotoStatement) statementNode() {}
 
@@ -70,9 +100,10 @@ func (*CallStatement) statementNode() {}
 
 type SetStatement struct {
 	Name       string
-	Value      []WordPart
-	Arithmetic bool // SET /A
-	Prompt     bool // SET /P
+	Value      [][]WordPart // word groups, joined with " " (preserves spaces)
+	HasEquals  bool         // true if = was present (distinguishes set to empty from display)
+	Arithmetic bool         // SET /A
+	Prompt     bool         // SET /P
 }
 
 func (*SetStatement) statementNode() {}
@@ -80,9 +111,6 @@ func (*SetStatement) statementNode() {}
 // --- ECHO ---
 
 type EchoStatement struct {
-	// Args is a list of word groups. Each group is one whitespace-separated
-	// token from the original line (e.g. ["hello", "%NAME%", "world"]).
-	// Groups are joined with " " during execution.
 	Args    [][]WordPart
 	TurnOn  *bool // nil = not a toggle; true = ECHO ON, false = ECHO OFF
 	Newline bool  // ECHO. prints a blank line
@@ -102,10 +130,10 @@ const (
 )
 
 type ForStatement struct {
-	Variable string // e.g. "I" from %%I
+	Variable string
 	Kind     ForKind
-	InList   []string // items for ForInList / ForInFiles / range params
-	Options  string   // FOR /F options string
+	InList   []string
+	Options  string
 	Body     []Statement
 }
 
@@ -115,10 +143,29 @@ func (*ForStatement) statementNode() {}
 
 type ExitStatement struct {
 	Code    int
-	SubOnly bool // EXIT /B exits subroutine only, not whole shell
+	SubOnly bool // EXIT /B
 }
 
 func (*ExitStatement) statementNode() {}
+
+// --- SHIFT ---
+
+type ShiftStatement struct{}
+
+func (*ShiftStatement) statementNode() {}
+
+// --- SETLOCAL / ENDLOCAL ---
+
+type SetlocalStatement struct {
+	EnableDelayedExpansion  bool
+	DisableDelayedExpansion bool
+}
+
+func (*SetlocalStatement) statementNode() {}
+
+type EndlocalStatement struct{}
+
+func (*EndlocalStatement) statementNode() {}
 
 // --- Label (jump target) ---
 
@@ -128,7 +175,6 @@ func (*LabelStatement) statementNode() {}
 
 // --- WordPart: a word is a sequence of these ---
 
-// WordPart is a segment of a word — either a literal string or a variable ref.
 type WordPart interface{ wordPartNode() }
 
 type LiteralPart struct{ Text string }
@@ -136,8 +182,33 @@ type LiteralPart struct{ Text string }
 func (*LiteralPart) wordPartNode() {}
 
 type VarPart struct {
-	Name     string // variable name, or "" for positional
-	Positional int  // 0-9 if positional; -1 otherwise
+	Name       string // variable name, or "" for positional
+	Positional int    // 0-9 if positional; -1 otherwise
 }
 
 func (*VarPart) wordPartNode() {}
+
+// DelayedVarPart represents a !VAR! delayed-expansion variable reference.
+type DelayedVarPart struct {
+	Name string
+}
+
+func (*DelayedVarPart) wordPartNode() {}
+
+// TildeVarPart represents %~1, %~dp0, etc. (parameter with tilde modifiers).
+type TildeVarPart struct {
+	Positional int    // the digit (0-9)
+	Modifiers  string // modifier letters: d, p, n, x, f, s, a, t, z, or empty (strip quotes)
+}
+
+func (*TildeVarPart) wordPartNode() {}
+
+// SubstringVarPart represents %VAR:~N% or %VAR:~N,M%.
+type SubstringVarPart struct {
+	Name      string
+	Start     int
+	Length    int
+	HasLength bool
+}
+
+func (*SubstringVarPart) wordPartNode() {}

@@ -13,7 +13,12 @@ import "strings"
 // Tokenize splits a single logical line into tokens.
 // The caller is responsible for stripping a leading @ before calling.
 func Tokenize(line string) []Token {
-	l := &lexer{input: line, pos: 0}
+	return TokenizeWithOpts(line, false)
+}
+
+// TokenizeWithOpts tokenizes with explicit delayed expansion control.
+func TokenizeWithOpts(line string, delayedExpansion bool) []Token {
+	l := &lexer{input: line, pos: 0, delayedExpansion: delayedExpansion}
 	return l.tokenize()
 }
 
@@ -26,50 +31,56 @@ type lexer struct {
 func (l *lexer) tokenize() []Token {
 	var tokens []Token
 	for {
+		posBefore := l.pos
 		l.skipSpaces()
+		hadSpace := l.pos > posBefore || l.pos == 0 // first token counts as having a space
 		if l.pos >= len(l.input) {
 			tokens = append(tokens, Token{Kind: EOF, Pos: l.pos})
 			break
 		}
 
 		ch := l.input[l.pos]
+		addToken := func(tok Token) {
+			tok.SpaceBefore = hadSpace
+			tokens = append(tokens, tok)
+		}
 
 		switch {
 		case ch == '|' && l.peek(1) == '|':
-			tokens = append(tokens, Token{Kind: OR, Value: "||", Pos: l.pos})
+			addToken(Token{Kind: OR, Value: "||", Pos: l.pos})
 			l.pos += 2
 
 		case ch == '&' && l.peek(1) == '&':
-			tokens = append(tokens, Token{Kind: AND, Value: "&&", Pos: l.pos})
+			addToken(Token{Kind: AND, Value: "&&", Pos: l.pos})
 			l.pos += 2
 
+		case ch == '&':
+			addToken(Token{Kind: AMPERSAND, Value: "&", Pos: l.pos})
+			l.pos++
+
 		case ch == '|':
-			tokens = append(tokens, Token{Kind: PIPE, Value: "|", Pos: l.pos})
+			addToken(Token{Kind: PIPE, Value: "|", Pos: l.pos})
 			l.pos++
 
 		case ch == '(':
-			tokens = append(tokens, Token{Kind: LPAREN, Value: "(", Pos: l.pos})
+			addToken(Token{Kind: LPAREN, Value: "(", Pos: l.pos})
 			l.pos++
 
 		case ch == ')':
-			tokens = append(tokens, Token{Kind: RPAREN, Value: ")", Pos: l.pos})
+			addToken(Token{Kind: RPAREN, Value: ")", Pos: l.pos})
 			l.pos++
 
 		case ch == '>' || ch == '<' || isRedirectStart(l.input, l.pos):
-			tok := l.readRedirect()
-			tokens = append(tokens, tok)
+			addToken(l.readRedirect())
 
 		case ch == '%':
-			tok := l.readPercentVar()
-			tokens = append(tokens, tok)
+			addToken(l.readPercentVar())
 
 		case ch == '!' && l.delayedExpansion:
-			tok := l.readBangVar()
-			tokens = append(tokens, tok)
+			addToken(l.readBangVar())
 
 		default:
-			tok := l.readWord()
-			tokens = append(tokens, tok)
+			addToken(l.readWord())
 		}
 	}
 	return tokens
@@ -144,11 +155,24 @@ func (l *lexer) readRedirect() Token {
 	return Token{Kind: REDIRECTION, Value: sb.String(), Pos: start}
 }
 
-// readPercentVar reads %VAR% or a positional %0-%9.
+// readPercentVar reads %VAR%, %0-%9, %~[modifiers]N, %VAR:~N,M%, or %%I.
 // If no closing % is found, treats it as a plain WORD.
 func (l *lexer) readPercentVar() Token {
 	start := l.pos
 	l.pos++ // consume opening %
+
+	// %~[modifiers]N — tilde parameter modifier
+	if l.pos < len(l.input) && l.input[l.pos] == '~' {
+		l.pos++ // consume ~
+		var sb strings.Builder
+		sb.WriteString("%~")
+		// Read modifier letters and trailing digit
+		for l.pos < len(l.input) && (isAlphaNum(l.input[l.pos]) || l.input[l.pos] == '$') {
+			sb.WriteByte(l.input[l.pos])
+			l.pos++
+		}
+		return Token{Kind: PERCENT_VAR, Value: sb.String(), Pos: start}
+	}
 
 	// positional: %0 .. %9
 	if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
@@ -166,14 +190,12 @@ func (l *lexer) readPercentVar() Token {
 			l.pos++
 			return Token{Kind: PERCENT_VAR, Value: "%%" + string(ch), Pos: start}
 		}
-		// Otherwise literal %
 		return Token{Kind: WORD, Value: "%", Pos: start}
 	}
 
-	// %VAR%
+	// %VAR% or %VAR:~N,M% or %VAR:old=new%
 	end := strings.IndexByte(l.input[l.pos:], '%')
 	if end == -1 {
-		// no closing %, treat % as literal word char and continue
 		return Token{Kind: WORD, Value: "%", Pos: start}
 	}
 	name := l.input[l.pos : l.pos+end]
@@ -207,10 +229,10 @@ func (l *lexer) readWord() Token {
 		if ch == ' ' || ch == '\t' || ch == '|' || ch == '(' || ch == ')' {
 			break
 		}
-		if ch == '&' && l.peek(1) == '&' {
+		if ch == '&' {
 			break
 		}
-		if ch == '|' && l.peek(1) == '|' {
+		if ch == '|' {
 			break
 		}
 		if ch == '>' || ch == '<' || isRedirectStart(l.input, l.pos) {

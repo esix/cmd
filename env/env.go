@@ -13,11 +13,18 @@ import (
 
 // Env holds shell variables and the current exit code.
 type Env struct {
-	vars     map[string]string
-	stack    []map[string]string // for SETLOCAL / ENDLOCAL
-	ExitCode int
-	FileMode bool // true when executing a .bat file (affects %% vs % in FOR)
-	Echo     bool // ECHO ON / ECHO OFF
+	vars             map[string]string
+	stack            []scope // for SETLOCAL / ENDLOCAL
+	ExitCode         int
+	FileMode         bool // true when executing a .bat file (affects %% vs % in FOR)
+	Echo             bool // ECHO ON / ECHO OFF
+	DelayedExpansion bool // SETLOCAL EnableDelayedExpansion
+}
+
+// scope captures the full environment state at SETLOCAL time.
+type scope struct {
+	vars             map[string]string
+	delayedExpansion bool
 }
 
 // New creates an Env pre-populated with the process environment.
@@ -61,7 +68,10 @@ func (e *Env) Push() {
 	for k, v := range e.vars {
 		snapshot[k] = v
 	}
-	e.stack = append(e.stack, snapshot)
+	e.stack = append(e.stack, scope{
+		vars:             snapshot,
+		delayedExpansion: e.DelayedExpansion,
+	})
 }
 
 // All returns a copy of all variables.
@@ -81,6 +91,7 @@ func (e *Env) Pop() bool {
 	}
 	top := e.stack[len(e.stack)-1]
 	e.stack = e.stack[:len(e.stack)-1]
-	e.vars = top
+	e.vars = top.vars
+	e.DelayedExpansion = top.delayedExpansion
 	return true
 }
