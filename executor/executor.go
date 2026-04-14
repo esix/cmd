@@ -29,7 +29,13 @@ type Executor struct {
 	stmts      []parser.Statement // used by RunStmts (interactive / inline)
 	lines      []scriptLine       // used by RunFile (lazy parsing)
 	pc         int                // current line or statement index
-	gotoPending bool              // true when GOTO was executed in a nested context
+	gotoPending bool // true when GOTO was executed in a nested context
+	exitPending bool // true when EXIT /B was executed in a nested context
+}
+
+// shouldStop returns true if GOTO or EXIT /B is pending.
+func (ex *Executor) shouldStop() bool {
+	return ex.gotoPending || ex.exitPending
 }
 
 // New creates an Executor.
@@ -70,32 +76,42 @@ func (ex *Executor) RunLine(line string) int {
 	return ex.RunStmts(stmts, nil)
 }
 
+// fileCache caches preprocessed script lines to avoid re-reading and
+// re-processing the same .bat file on every CALL.
+// fileCache caches preprocessed script lines.
+var fileCache = make(map[string][]scriptLine)
+
 // RunFile executes a .bat file. Lines are parsed on-the-fly so that
 // SETLOCAL EnableDelayedExpansion takes effect for subsequent lines.
 func (ex *Executor) RunFile(path string, args []string) int {
+	// Resolve to absolute path for cache key
+	absPath, _ := filepath.Abs(path)
+
+	slines, cached := fileCache[absPath]
+	if cached {
+		return ex.runLines(slines, path, args)
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Cannot open file: %s\n", path)
 		return 1
 	}
 
-	ex.env.FileMode = true
-	savedPos := ex.positional
-	ex.positional = append([]string{path}, args...)
-
 	// Pre-process lines: classify as label or code, skip blanks and REM
 	rawLines := strings.Split(string(data), "\n")
-	var slines []scriptLine
+	slines = nil
 	for _, line := range rawLines {
 		line = strings.TrimRight(line, "\r")
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		// Strip leading @ (echo suppression marker)
-		if strings.HasPrefix(line, "@") {
-			line = line[1:]
-		}
+		// Strip leading @ (echo suppression marker) — may have leading whitespace
 		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "@") {
+			trimmed = strings.TrimSpace(trimmed[1:])
+			line = trimmed
+		}
 
 		// Shebang line
 		if strings.HasPrefix(trimmed, "#!") {
@@ -130,7 +146,18 @@ func (ex *Executor) RunFile(path string, args []string) int {
 	// Join multi-line ( ... ) blocks into single lines using & as separator
 	slines = joinBlocks(slines)
 
-	// Execute line-by-line with lazy parsing
+	// Cache for future calls
+	fileCache[absPath] = slines
+
+	return ex.runLines(slines, path, args)
+}
+
+
+func (ex *Executor) runLines(slines []scriptLine, path string, args []string) int {
+	ex.env.FileMode = true
+	savedPos := ex.positional
+	ex.positional = append([]string{path}, args...)
+
 	savedLines := ex.lines
 	savedPC := ex.pc
 	ex.lines = slines
@@ -156,7 +183,12 @@ func (ex *Executor) RunFile(path string, args []string) int {
 			code = ex.execute(stmt)
 			ex.env.ExitCode = code
 			if ex.gotoPending {
-				ex.gotoPending = false // consumed by the file-level loop
+				ex.gotoPending = false
+				break
+			}
+			if ex.exitPending {
+				ex.exitPending = false
+				ex.pc = len(ex.lines) // stop file execution
 				break
 			}
 		}
@@ -186,14 +218,14 @@ func (ex *Executor) RunStmts(stmts []parser.Statement, positional []string) int 
 		ex.pc++
 		code = ex.execute(stmt)
 		ex.env.ExitCode = code
-		if ex.gotoPending {
-			break // bubble up GOTO to the file-level loop
+		if ex.shouldStop() {
+			break
 		}
 	}
 
 	ex.stmts = saved
-	if !ex.gotoPending {
-		ex.pc = savedPC // only restore pc if no GOTO is pending
+	if !ex.gotoPending && !ex.exitPending {
+		ex.pc = savedPC
 	}
 	ex.positional = savedPos
 	return code
@@ -351,7 +383,7 @@ func (ex *Executor) runPipeStage(stmt parser.Statement, stdin io.Reader, stdout 
 
 func (ex *Executor) execChain(s *parser.ChainStatement) int {
 	leftCode := ex.execute(s.Left)
-	if ex.gotoPending {
+	if ex.shouldStop() {
 		return leftCode
 	}
 	switch s.Op {
@@ -378,7 +410,7 @@ func (ex *Executor) execBlock(s *parser.BlockStatement) int {
 	for _, stmt := range s.Stmts {
 		code = ex.execute(stmt)
 		ex.env.ExitCode = code
-		if ex.gotoPending {
+		if ex.shouldStop() {
 			break
 		}
 	}
@@ -455,7 +487,10 @@ func (ex *Executor) execSet(s *parser.SetStatement) int {
 	value := strings.Join(words, " ")
 
 	if s.Arithmetic {
-		// SET /A: evaluate as integer arithmetic
+		// Expand !VAR! in arithmetic expressions when delayed expansion is on
+		if ex.env.DelayedExpansion {
+			value = expander.ExpandBangs(value, ex.env)
+		}
 		return builtins.Set([]string{"/A", s.Name + "=" + value}, ex.env)
 	}
 
@@ -496,21 +531,41 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 	case *parser.NumericCompare:
 		left := stripOuterQuotes(ex.expandParts(c.Left))
 		right := stripOuterQuotes(ex.expandParts(c.Right))
-		l, _ := strconv.Atoi(strings.TrimSpace(left))
-		r, _ := strconv.Atoi(strings.TrimSpace(right))
-		switch c.Op {
-		case "EQU":
-			return l == r
-		case "NEQ":
-			return l != r
-		case "LSS":
-			return l < r
-		case "LEQ":
-			return l <= r
-		case "GTR":
-			return l > r
-		case "GEQ":
-			return l >= r
+		// CMD behavior: try numeric first, fall back to string comparison
+		lNum, lErr := strconv.Atoi(strings.TrimSpace(left))
+		rNum, rErr := strconv.Atoi(strings.TrimSpace(right))
+		if lErr == nil && rErr == nil {
+			// Both are numbers: numeric comparison
+			switch c.Op {
+			case "EQU":
+				return lNum == rNum
+			case "NEQ":
+				return lNum != rNum
+			case "LSS":
+				return lNum < rNum
+			case "LEQ":
+				return lNum <= rNum
+			case "GTR":
+				return lNum > rNum
+			case "GEQ":
+				return lNum >= rNum
+			}
+		} else {
+			// Fall back to string comparison
+			switch c.Op {
+			case "EQU":
+				return left == right
+			case "NEQ":
+				return left != right
+			case "LSS":
+				return left < right
+			case "LEQ":
+				return left <= right
+			case "GTR":
+				return left > right
+			case "GEQ":
+				return left >= right
+			}
 		}
 
 	case *parser.DefinedCondition:
@@ -620,16 +675,17 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 								break
 							}
 							code = ex.execute(stmt)
-							if ex.gotoPending {
+							if ex.shouldStop() {
 								break
 							}
 						}
-						if done {
+						if done || ex.exitPending {
+							ex.exitPending = false
 							break
 						}
 						if ex.gotoPending {
-							ex.gotoPending = false // GOTO within subroutine
-							continue               // resume from new PC
+							ex.gotoPending = false
+							continue
 						}
 					}
 					ex.pc = savedPC
@@ -886,7 +942,7 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 		}
 
 		code = ex.RunStmts(s.Body, nil)
-		if ex.gotoPending {
+		if ex.shouldStop() {
 			break
 		}
 	}
@@ -917,13 +973,7 @@ func (ex *Executor) execEndlocal() int {
 
 func (ex *Executor) execExit(s *parser.ExitStatement) int {
 	if s.SubOnly {
-		// EXIT /B: signal to stop — set pc past end of whichever loop is active
-		if ex.lines != nil {
-			ex.pc = len(ex.lines)
-		}
-		if ex.stmts != nil {
-			ex.pc = len(ex.stmts)
-		}
+		ex.exitPending = true
 		return s.Code
 	}
 	os.Exit(s.Code)
@@ -966,7 +1016,12 @@ func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int 
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// Apply redirections
+	// Apply redirections (translate Windows nul → /dev/null)
+	for i := range redirects {
+		if strings.ToLower(redirects[i].File) == "nul" {
+			redirects[i].File = "/dev/null"
+		}
+	}
 	for _, r := range redirects {
 		switch r.Op {
 		case ">", "1>":
@@ -1018,6 +1073,27 @@ func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int 
 
 // joinBlocks merges multi-line parenthesized blocks into single lines.
 // e.g. "if cond (\n  cmd1\n  cmd2\n)" becomes "if cond ( cmd1 & cmd2 )"
+// countUnquotedParens counts ( and ) outside of quoted strings.
+func countUnquotedParens(line string) int {
+	depth := 0
+	inQuote := false
+	for i := 0; i < len(line); i++ {
+		switch line[i] {
+		case '"':
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				depth++
+			}
+		case ')':
+			if !inQuote {
+				depth--
+			}
+		}
+	}
+	return depth
+}
+
 func joinBlocks(lines []scriptLine) []scriptLine {
 	var result []scriptLine
 	depth := 0
@@ -1026,7 +1102,6 @@ func joinBlocks(lines []scriptLine) []scriptLine {
 	for _, sl := range lines {
 		if sl.label != "" {
 			if depth > 0 {
-				// Label inside a block: flush the block and add the label
 				result = append(result, scriptLine{raw: accum})
 				accum = ""
 				depth = 0
@@ -1036,7 +1111,7 @@ func joinBlocks(lines []scriptLine) []scriptLine {
 		}
 
 		line := sl.raw
-		opens := strings.Count(line, "(") - strings.Count(line, ")")
+		opens := countUnquotedParens(line)
 
 		if depth == 0 && opens <= 0 {
 			result = append(result, sl)

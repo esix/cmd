@@ -22,15 +22,23 @@ func ExpandPercent(line string, e *env.Env, positional []string) string {
 		}
 
 		// %% → literal %
+		// %% handling:
+		// %%X (single letter, not followed by alnum) → FOR variable, keep %%X
+		// Otherwise → keep %% intact (SET /A modulo or literal)
 		if i+1 < len(line) && line[i+1] == '%' {
-			// %%X → FOR variable (leave as-is for the lexer)
-			if i+2 < len(line) && isAlphaNum(line[i+2]) {
-				sb.WriteByte('%')
-				sb.WriteByte('%')
-				sb.WriteByte(line[i+2])
-				i += 3
-				continue
+			if i+2 < len(line) {
+				ch := line[i+2]
+				isLetter := (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+				nextIsAlnum := i+3 < len(line) && isAlphaNum(line[i+3])
+				if isLetter && !nextIsAlnum {
+					sb.WriteByte('%')
+					sb.WriteByte('%')
+					sb.WriteByte(ch)
+					i += 3
+					continue
+				}
 			}
+			sb.WriteByte('%')
 			sb.WriteByte('%')
 			i += 2
 			continue

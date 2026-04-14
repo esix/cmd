@@ -121,7 +121,8 @@ func Set(args []string, e *env.Env) int {
 func evalArith(expr string, e *env.Env) (int, error) {
 	expr = strings.TrimSpace(expr)
 
-	// Replace variable references %VAR% with their numeric values
+	// Replace %VAR% references with their values (already done by early expansion,
+	// but handle any remaining ones)
 	for {
 		start := strings.IndexByte(expr, '%')
 		if start == -1 {
@@ -136,19 +137,124 @@ func evalArith(expr string, e *env.Env) (int, error) {
 		expr = expr[:start] + val + expr[start+1+end+1:]
 	}
 
+	// %% is the modulo operator in SET /A (double % survives early expansion)
+	expr = strings.ReplaceAll(expr, "%%", "%")
+
+	// Set env for variable resolution in expressions (e.g. "d/4096")
+	arithEnv = e
 	return evalExpr(expr)
 }
 
-// evalExpr is a minimal recursive-descent evaluator for +, -, *, /, %.
+// evalExpr: recursive descent with correct CMD SET /A precedence.
+// From lowest to highest: | ^ & << >> + - * / %
 func evalExpr(expr string) (int, error) {
 	expr = strings.TrimSpace(expr)
-	return parseAddSub(expr)
-}
-
-func parseAddSub(expr string) (int, error) {
-	left, rest, err := parseMulDiv(expr)
+	val, rest, err := parseBitOr(expr)
 	if err != nil {
 		return 0, err
+	}
+	rest = strings.TrimSpace(rest)
+	if rest != "" && rest[0] != ')' {
+		return val, nil // ignore trailing text
+	}
+	return val, nil
+}
+
+func parseBitOr(expr string) (int, string, error) {
+	left, rest, err := parseBitXor(expr)
+	if err != nil {
+		return 0, expr, err
+	}
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" || rest[0] != '|' {
+			break
+		}
+		right, newRest, err := parseBitXor(rest[1:])
+		if err != nil {
+			return 0, rest, err
+		}
+		left = left | right
+		rest = newRest
+	}
+	return left, rest, nil
+}
+
+func parseBitXor(expr string) (int, string, error) {
+	left, rest, err := parseBitAnd(expr)
+	if err != nil {
+		return 0, expr, err
+	}
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" || rest[0] != '^' {
+			break
+		}
+		right, newRest, err := parseBitAnd(rest[1:])
+		if err != nil {
+			return 0, rest, err
+		}
+		left = left ^ right
+		rest = newRest
+	}
+	return left, rest, nil
+}
+
+func parseBitAnd(expr string) (int, string, error) {
+	left, rest, err := parseShift(expr)
+	if err != nil {
+		return 0, expr, err
+	}
+	for {
+		rest = strings.TrimSpace(rest)
+		if rest == "" || rest[0] != '&' {
+			break
+		}
+		right, newRest, err := parseShift(rest[1:])
+		if err != nil {
+			return 0, rest, err
+		}
+		left = left & right
+		rest = newRest
+	}
+	return left, rest, nil
+}
+
+func parseShift(expr string) (int, string, error) {
+	left, rest, err := parseAddSub(expr)
+	if err != nil {
+		return 0, expr, err
+	}
+	for {
+		rest = strings.TrimSpace(rest)
+		if len(rest) < 2 {
+			break
+		}
+		if rest[0] == '<' && rest[1] == '<' {
+			right, newRest, err := parseAddSub(rest[2:])
+			if err != nil {
+				return 0, rest, err
+			}
+			left = left << uint(right)
+			rest = newRest
+		} else if rest[0] == '>' && rest[1] == '>' {
+			right, newRest, err := parseAddSub(rest[2:])
+			if err != nil {
+				return 0, rest, err
+			}
+			left = left >> uint(right)
+			rest = newRest
+		} else {
+			break
+		}
+	}
+	return left, rest, nil
+}
+
+func parseAddSub(expr string) (int, string, error) {
+	left, rest, err := parseMulDiv(expr)
+	if err != nil {
+		return 0, "", err
 	}
 	for {
 		rest = strings.TrimSpace(rest)
@@ -161,7 +267,7 @@ func parseAddSub(expr string) (int, error) {
 		}
 		right, newRest, err := parseMulDiv(rest[1:])
 		if err != nil {
-			return 0, err
+			return 0, rest, err
 		}
 		if op == '+' {
 			left += right
@@ -170,7 +276,7 @@ func parseAddSub(expr string) (int, error) {
 		}
 		rest = newRest
 	}
-	return left, nil
+	return left, rest, nil
 }
 
 func parseMulDiv(expr string) (int, string, error) {
@@ -211,10 +317,27 @@ func parseMulDiv(expr string) (int, string, error) {
 	return left, rest, nil
 }
 
+// arithEnv is set before evaluating so parseAtom can resolve variable names.
+var arithEnv *env.Env
+
 func parseAtom(expr string) (int, string, error) {
 	expr = strings.TrimSpace(expr)
 	if expr == "" {
 		return 0, "", fmt.Errorf("unexpected end of expression")
+	}
+
+	// Parenthesized sub-expression
+	if expr[0] == '(' {
+		inner := expr[1:]
+		val, rest, err := parseAddSubRest(inner)
+		if err != nil {
+			return 0, expr, err
+		}
+		rest = strings.TrimSpace(rest)
+		if len(rest) > 0 && rest[0] == ')' {
+			rest = rest[1:]
+		}
+		return val, rest, nil
 	}
 
 	// Unary minus
@@ -223,14 +346,61 @@ func parseAtom(expr string) (int, string, error) {
 		return -val, rest, err
 	}
 
-	// Read digits
-	i := 0
-	for i < len(expr) && expr[i] >= '0' && expr[i] <= '9' {
-		i++
+	// Unary plus
+	if expr[0] == '+' {
+		return parseAtom(expr[1:])
 	}
-	if i == 0 {
-		return 0, expr, fmt.Errorf("expected number, got %q", expr)
+
+	// Hex literal: 0x...
+	if len(expr) >= 2 && expr[0] == '0' && (expr[1] == 'x' || expr[1] == 'X') {
+		i := 2
+		for i < len(expr) && isHexDigit(expr[i]) {
+			i++
+		}
+		n, _ := strconv.ParseInt(expr[2:i], 16, 64)
+		return int(n), expr[i:], nil
 	}
-	n, _ := strconv.Atoi(expr[:i])
-	return n, expr[i:], nil
+
+	// Numeric literal
+	if expr[0] >= '0' && expr[0] <= '9' {
+		i := 0
+		for i < len(expr) && expr[i] >= '0' && expr[i] <= '9' {
+			i++
+		}
+		n, _ := strconv.Atoi(expr[:i])
+		return n, expr[i:], nil
+	}
+
+	// Variable name: letters, digits, underscore (resolve to its numeric value)
+	if isVarStart(expr[0]) {
+		i := 0
+		for i < len(expr) && isVarChar(expr[i]) {
+			i++
+		}
+		name := expr[:i]
+		val := 0
+		if arithEnv != nil {
+			val, _ = strconv.Atoi(arithEnv.Get(name))
+		}
+		return val, expr[i:], nil
+	}
+
+	return 0, expr, fmt.Errorf("expected number, got %q", expr)
+}
+
+// parseAddSubRest is used by parenthesized sub-expressions.
+func parseAddSubRest(expr string) (int, string, error) {
+	return parseBitOr(expr)
+}
+
+func isHexDigit(c byte) bool {
+	return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')
+}
+
+func isVarStart(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_'
+}
+
+func isVarChar(c byte) bool {
+	return isVarStart(c) || (c >= '0' && c <= '9')
 }

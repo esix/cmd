@@ -268,6 +268,14 @@ func (p *parser) parseSet() (Statement, error) {
 	}
 	valueGroups = append(valueGroups, p.collectWordGroups()...)
 
+	// Consume trailing redirections (e.g. SET /A "d=1" 2>nul)
+	for p.peek().Kind == lexer.REDIRECTION {
+		p.consume() // redirect op
+		if p.peek().Kind == lexer.WORD {
+			p.consume() // redirect target
+		}
+	}
+
 	return &SetStatement{
 		Name:       name,
 		Value:      valueGroups,
@@ -387,7 +395,8 @@ func (p *parser) parseIfBody() (then []Statement, elseStmts []Statement, err err
 		}
 		then = block.(*BlockStatement).Stmts
 	} else {
-		thenStmt, err := p.parseOne()
+		// In CMD, the THEN body extends to end of line (including & chains)
+		thenStmt, err := p.parseChain()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -406,7 +415,7 @@ func (p *parser) parseIfBody() (then []Statement, elseStmts []Statement, err err
 			}
 			elseStmts = block.(*BlockStatement).Stmts
 		} else {
-			elseStmt, err := p.parseOne()
+			elseStmt, err := p.parseChain()
 			if err != nil {
 				return nil, nil, err
 			}

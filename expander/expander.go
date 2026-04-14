@@ -29,7 +29,7 @@ func ExpandWord(parts []parser.WordPart, e *env.Env, positional []string) string
 				sb.WriteString(e.Get(pt.Name))
 			}
 		case *parser.DelayedVarPart:
-			sb.WriteString(e.Get(pt.Name))
+			sb.WriteString(expandDelayedRef(pt.Name, e))
 		case *parser.TildeVarPart:
 			sb.WriteString(expandTilde(pt, positional))
 		case *parser.SubstringVarPart:
@@ -151,6 +151,26 @@ func expandSubstring(pt *parser.SubstringVarPart, e *env.Env) string {
 	return val[start:end]
 }
 
+// expandDelayedRef resolves a delayed variable reference which may contain
+// substring (:~N,M) or replacement (:old=new) modifiers.
+func expandDelayedRef(name string, e *env.Env) string {
+	if colonIdx := strings.Index(name, ":~"); colonIdx != -1 {
+		varName := name[:colonIdx]
+		spec := name[colonIdx+2:]
+		return substringExpand(e.Get(varName), spec)
+	}
+	if colonIdx := strings.IndexByte(name, ':'); colonIdx != -1 {
+		eqIdx := strings.IndexByte(name[colonIdx+1:], '=')
+		if eqIdx != -1 {
+			varName := name[:colonIdx]
+			old := name[colonIdx+1 : colonIdx+1+eqIdx]
+			newStr := name[colonIdx+1+eqIdx+1:]
+			return strings.ReplaceAll(e.Get(varName), old, newStr)
+		}
+	}
+	return e.Get(name)
+}
+
 // ExpandBangs expands !VAR! patterns in a string (delayed expansion).
 func ExpandBangs(s string, e *env.Env) string {
 	return expandBangs(s, e)
@@ -178,6 +198,31 @@ func expandBangs(s string, e *env.Env) string {
 			i += 2
 			continue
 		}
+
+		// !VAR:~N,M! — substring
+		if colonIdx := strings.Index(name, ":~"); colonIdx != -1 {
+			varName := name[:colonIdx]
+			spec := name[colonIdx+2:]
+			val := e.Get(varName)
+			sb.WriteString(substringExpand(val, spec))
+			i += j + 2
+			continue
+		}
+
+		// !VAR:old=new! — string replacement
+		if colonIdx := strings.IndexByte(name, ':'); colonIdx != -1 {
+			eqIdx := strings.IndexByte(name[colonIdx+1:], '=')
+			if eqIdx != -1 {
+				varName := name[:colonIdx]
+				old := name[colonIdx+1 : colonIdx+1+eqIdx]
+				newStr := name[colonIdx+1+eqIdx+1:]
+				val := e.Get(varName)
+				sb.WriteString(strings.ReplaceAll(val, old, newStr))
+				i += j + 2
+				continue
+			}
+		}
+
 		sb.WriteString(e.Get(name))
 		i += j + 2
 	}
