@@ -664,6 +664,9 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 
 	// CALL script.bat [args...]
 	scriptPath := first
+	if resolved, ok := ex.resolveBat(scriptPath); ok {
+		scriptPath = resolved
+	}
 	var scriptArgs []string
 	for _, part := range s.Args[1:] {
 		scriptArgs = append(scriptArgs, ex.expandParts([]parser.WordPart{part}))
@@ -948,7 +951,7 @@ func (ex *Executor) execSimple(s *parser.SimpleCommand) int {
 	}
 
 	// .bat file typed directly (e.g. "myscript.bat" or "myscript")
-	if batPath, ok := resolveBat(args[0]); ok {
+	if batPath, ok := ex.resolveBat(args[0]); ok {
 		sub := &Executor{env: ex.env}
 		return sub.RunFile(batPath, args[1:])
 	}
@@ -1064,18 +1067,34 @@ func joinBlocks(lines []scriptLine) []scriptLine {
 
 // resolveBat checks if name refers to a .bat file (with or without extension).
 // Returns the resolved path and true if found.
-func resolveBat(name string) (string, bool) {
-	// Explicit .bat extension
-	if strings.HasSuffix(strings.ToLower(name), ".bat") {
-		if _, err := os.Stat(name); err == nil {
-			return name, true
-		}
-		return "", false
+func (ex *Executor) resolveBat(name string) (string, bool) {
+	candidates := []string{name}
+	lower := strings.ToLower(name)
+	if !strings.HasSuffix(lower, ".bat") && !strings.HasSuffix(lower, ".cmd") {
+		candidates = append(candidates, name+".bat", name+".cmd")
 	}
-	// Try appending .bat
-	candidate := name + ".bat"
-	if _, err := os.Stat(candidate); err == nil {
-		return candidate, true
+
+	// Check CWD first
+	for _, c := range candidates {
+		if _, err := os.Stat(c); err == nil {
+			return c, true
+		}
+	}
+
+	// Search PATH from our env (which BAT scripts can modify via SET)
+	pathEnv := ex.env.Get("PATH")
+	if pathEnv == "" {
+		pathEnv = os.Getenv("PATH")
+	}
+	// BAT uses ; as PATH separator, Unix uses : — support both
+	pathEnv = strings.ReplaceAll(pathEnv, ";", string(filepath.ListSeparator))
+	for _, dir := range filepath.SplitList(pathEnv) {
+		for _, c := range candidates {
+			full := filepath.Join(dir, c)
+			if _, err := os.Stat(full); err == nil {
+				return full, true
+			}
+		}
 	}
 	return "", false
 }

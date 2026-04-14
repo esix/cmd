@@ -20,6 +20,8 @@ var Registry = map[string]Func{
 	"REM":   Rem,
 	"TYPE":   Type,
 	"SHIFT":  func(_ []string, _ *env.Env) int { return 0 },
+	"PUSHD":  Pushd,
+	"POPD":   Popd,
 	"DEL":    Del,
 	"ERASE":  Del,
 	"COPY":   Copy,
