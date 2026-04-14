@@ -3,6 +3,7 @@ package executor
 
 import (
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -101,11 +102,19 @@ func (ex *Executor) RunFile(path string, args []string) int {
 			continue
 		}
 
+		// :: comment (double colon = label that's never matched)
+		if strings.HasPrefix(trimmed, "::") {
+			continue
+		}
+
 		// Label — only first word is the label name, rest is comment
 		if strings.HasPrefix(trimmed, ":") {
 			labelLine := strings.TrimSpace(trimmed[1:])
-			label := strings.Fields(labelLine)[0]
-			slines = append(slines, scriptLine{label: strings.ToUpper(label)})
+			fields := strings.Fields(labelLine)
+			if len(fields) == 0 {
+				continue
+			}
+			slines = append(slines, scriptLine{label: strings.ToUpper(fields[0])})
 			continue
 		}
 
@@ -208,6 +217,8 @@ func (ex *Executor) execute(stmt parser.Statement) int {
 		return ex.execExit(s)
 	case *parser.ShiftStatement:
 		return ex.execShift()
+	case *parser.PipeStatement:
+		return ex.execPipe(s)
 	case *parser.ChainStatement:
 		return ex.execChain(s)
 	case *parser.BlockStatement:
@@ -224,6 +235,116 @@ func (ex *Executor) execute(stmt parser.Statement) int {
 		fmt.Fprintf(os.Stderr, "unknown statement type: %T\n", stmt)
 		return 1
 	}
+}
+
+// --- PIPE: cmd1 | cmd2 | cmd3 ---
+
+func (ex *Executor) execPipe(s *parser.PipeStatement) int {
+	if len(s.Commands) == 0 {
+		return 0
+	}
+	if len(s.Commands) == 1 {
+		return ex.execute(s.Commands[0])
+	}
+
+	// Build pipe chain: create all intermediate pipes
+	n := len(s.Commands)
+	pipes := make([]io.ReadCloser, n-1) // pipes[i] = stdout of command i
+	writers := make([]io.WriteCloser, n-1)
+	for i := 0; i < n-1; i++ {
+		r, w, err := os.Pipe()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Pipe error: %v\n", err)
+			return 1
+		}
+		pipes[i] = r
+		writers[i] = w
+	}
+
+	// Run each stage in a goroutine
+	type result struct {
+		index int
+		code  int
+	}
+	done := make(chan result, n)
+
+	for i, stmt := range s.Commands {
+		var stdin io.Reader = os.Stdin
+		var stdout io.Writer = os.Stdout
+		if i > 0 {
+			stdin = pipes[i-1]
+		}
+		if i < n-1 {
+			stdout = writers[i]
+		}
+
+		go func(idx int, st parser.Statement, in io.Reader, out io.Writer) {
+			code := ex.runPipeStage(st, in, out)
+			// Close our write end so the next stage sees EOF
+			if wc, ok := out.(io.WriteCloser); ok && idx < n-1 {
+				wc.Close()
+			}
+			done <- result{idx, code}
+		}(i, stmt, stdin, stdout)
+	}
+
+	// Collect results
+	codes := make([]int, n)
+	for range s.Commands {
+		r := <-done
+		codes[r.index] = r.code
+	}
+
+	// Close read ends
+	for _, r := range pipes {
+		r.Close()
+	}
+
+	return codes[n-1] // exit code of last command
+}
+
+// runPipeStage runs a single command in a pipeline with redirected I/O.
+func (ex *Executor) runPipeStage(stmt parser.Statement, stdin io.Reader, stdout io.Writer) int {
+	// External command (SimpleCommand)
+	if simple, ok := stmt.(*parser.SimpleCommand); ok {
+		args := make([]string, 0, len(simple.Args))
+		for _, part := range simple.Args {
+			args = append(args, ex.expandParts([]parser.WordPart{part}))
+		}
+		if len(args) == 0 {
+			return 0
+		}
+		cmdName := strings.ToUpper(args[0])
+		// ECHO builtin — use system echo in pipe context
+		if cmdName == "ECHO" {
+			fmt.Fprintln(stdout, strings.Join(args[1:], " "))
+			return 0
+		}
+		cmd := exec.Command(args[0], args[1:]...)
+		cmd.Stdin = stdin
+		cmd.Stdout = stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				return exitErr.ExitCode()
+			}
+			return 1
+		}
+		return 0
+	}
+
+	// Builtin statements (ECHO, TYPE, etc.) — redirect stdout
+	if echo, ok := stmt.(*parser.EchoStatement); ok {
+		words := make([]string, 0, len(echo.Args))
+		for _, group := range echo.Args {
+			words = append(words, ex.expandParts(group))
+		}
+		fmt.Fprintln(stdout, strings.Join(words, " "))
+		return 0
+	}
+
+	// Fallback: run normally (stdout not redirected for complex statements)
+	return ex.execute(stmt)
 }
 
 // --- CHAIN: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2 ---
@@ -288,7 +409,36 @@ func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 	for _, group := range s.Args {
 		words = append(words, ex.expandParts(group))
 	}
-	return builtins.Echo(words, ex.env)
+	// Handle redirections (e.g. ECHO error 1>&2)
+	out := os.Stdout
+	for _, r := range s.Redirects {
+		switch r.Op {
+		case "1>&2", ">&2":
+			out = os.Stderr
+		case ">", "1>":
+			f, err := os.Create(r.File)
+			if err == nil {
+				defer f.Close()
+				out = f
+			}
+		case ">>", "1>>":
+			f, err := os.OpenFile(r.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				defer f.Close()
+				out = f
+			}
+		}
+	}
+	if len(words) == 0 {
+		if ex.env.Echo {
+			fmt.Fprintln(out, "ECHO is on.")
+		} else {
+			fmt.Fprintln(out, "ECHO is off.")
+		}
+		return 0
+	}
+	fmt.Fprintln(out, strings.Join(words, " "))
+	return 0
 }
 
 // --- SET ---
@@ -362,6 +512,9 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 		case "GEQ":
 			return l >= r
 		}
+
+	case *parser.DefinedCondition:
+		return ex.env.Get(c.Name) != ""
 
 	case *parser.ExistCondition:
 		path := ex.expandParts(c.Path)
@@ -528,6 +681,8 @@ func (ex *Executor) execFor(s *parser.ForStatement) int {
 		return ex.execForRange(s)
 	case parser.ForInList:
 		return ex.execForInList(s)
+	case parser.ForTokens:
+		return ex.execForTokens(s)
 	default:
 		fmt.Fprintf(os.Stderr, "FOR variant not yet implemented\n")
 		return 1
@@ -570,6 +725,166 @@ func (ex *Executor) execForInList(s *parser.ForStatement) int {
 		} else {
 			ex.env.Set(s.Variable, item)
 			code = ex.RunStmts(s.Body, nil)
+		}
+	}
+	return code
+}
+
+// --- FOR /F ---
+
+type forFOpts struct {
+	tokens  []int  // token indices (1-based); -1 = wildcard (rest of line)
+	delims  string // delimiter characters
+	eol     byte   // end-of-line comment char
+	usebackq bool
+}
+
+func parseForFOpts(optStr string) forFOpts {
+	opts := forFOpts{
+		tokens: []int{1},       // default: token 1
+		delims: " \t",          // default: space and tab
+		eol:    ';',            // default: semicolon
+	}
+	optStr = strings.Trim(optStr, "\"")
+	parts := strings.Fields(optStr)
+	for _, part := range parts {
+		lower := strings.ToLower(part)
+		if lower == "usebackq" {
+			opts.usebackq = true
+			continue
+		}
+		if strings.HasPrefix(lower, "eol=") {
+			if len(part) > 4 {
+				opts.eol = part[4]
+			}
+			continue
+		}
+		if strings.HasPrefix(lower, "tokens=") {
+			spec := part[7:]
+			opts.tokens = parseTokenSpec(spec)
+			continue
+		}
+		if strings.HasPrefix(lower, "delims=") {
+			opts.delims = part[7:]
+			continue
+		}
+	}
+	return opts
+}
+
+// parseTokenSpec parses "1,2*" or "1*" or "1,2,3" into token indices.
+// -1 represents the wildcard (*) = rest of line.
+func parseTokenSpec(spec string) []int {
+	var result []int
+	for _, part := range strings.Split(spec, ",") {
+		part = strings.TrimSpace(part)
+		wildcard := strings.HasSuffix(part, "*")
+		part = strings.TrimSuffix(part, "*")
+		if part != "" {
+			n, _ := strconv.Atoi(part)
+			result = append(result, n)
+		}
+		if wildcard {
+			result = append(result, -1) // wildcard marker
+		}
+	}
+	if len(result) == 0 {
+		result = []int{1}
+	}
+	return result
+}
+
+// splitByDelims splits s by any character in delims, returning non-empty tokens.
+func splitByDelims(s, delims string) []string {
+	if delims == "" {
+		return []string{s}
+	}
+	f := func(r rune) bool {
+		return strings.ContainsRune(delims, r)
+	}
+	return strings.FieldsFunc(s, f)
+}
+
+func (ex *Executor) execForTokens(s *parser.ForStatement) int {
+	opts := parseForFOpts(s.Options)
+
+	// Determine source lines
+	var lines []string
+	if len(s.InList) > 0 {
+		source := strings.Join(s.InList, " ")
+		source = strings.Trim(source, " ")
+		// Apply delayed expansion to the source
+		if ex.env.DelayedExpansion {
+			source = expander.ExpandBangs(source, ex.env)
+		}
+
+		if (strings.HasPrefix(source, "'") && strings.HasSuffix(source, "'")) ||
+			(strings.HasPrefix(source, "`") && strings.HasSuffix(source, "`")) {
+			// Command: execute and capture output
+			cmdStr := source[1 : len(source)-1]
+			out, err := exec.Command("sh", "-c", cmdStr).Output()
+			if err == nil {
+				lines = strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+			}
+		} else if strings.HasPrefix(source, "\"") && strings.HasSuffix(source, "\"") {
+			if opts.usebackq {
+				// usebackq + "..." = read from file
+				filename := source[1 : len(source)-1]
+				data, err := os.ReadFile(filename)
+				if err == nil {
+					lines = strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+				}
+			} else {
+				// "string" = parse the string directly
+				str := source[1 : len(source)-1]
+				lines = []string{str}
+			}
+		} else {
+			// Bare filename
+			data, err := os.ReadFile(source)
+			if err == nil {
+				lines = strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+			}
+		}
+	}
+
+	code := 0
+	baseVar := strings.ToUpper(s.Variable)
+
+	for _, line := range lines {
+		// Skip EOL comment lines
+		if opts.eol != 0 && len(line) > 0 && line[0] == opts.eol {
+			continue
+		}
+
+		fields := splitByDelims(line, opts.delims)
+
+		// Assign tokens to variables: %%a, %%b, %%c, ...
+		varChar := baseVar[0] // 'A', 'B', etc.
+		for i, tokIdx := range opts.tokens {
+			varName := string(rune(varChar) + rune(i))
+			if tokIdx == -1 {
+				// Wildcard: rest of line from the last assigned token's position
+				lastIdx := 0
+				if i > 0 && opts.tokens[i-1] > 0 {
+					lastIdx = opts.tokens[i-1]
+				}
+				// Rejoin remaining fields
+				if lastIdx < len(fields) {
+					ex.env.Set(varName, strings.Join(fields[lastIdx:], string(opts.delims[0:1])))
+				} else {
+					ex.env.Set(varName, "")
+				}
+			} else if tokIdx-1 < len(fields) {
+				ex.env.Set(varName, fields[tokIdx-1])
+			} else {
+				ex.env.Set(varName, "")
+			}
+		}
+
+		code = ex.RunStmts(s.Body, nil)
+		if ex.gotoPending {
+			break
 		}
 	}
 	return code
@@ -651,16 +966,38 @@ func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int 
 	// Apply redirections
 	for _, r := range redirects {
 		switch r.Op {
-		case ">":
+		case ">", "1>":
 			f, err := os.Create(r.File)
 			if err == nil {
 				cmd.Stdout = f
 				defer f.Close()
 			}
-		case ">>":
+		case ">>", "1>>":
 			f, err := os.OpenFile(r.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
 				cmd.Stdout = f
+				defer f.Close()
+			}
+		case "2>":
+			f, err := os.Create(r.File)
+			if err == nil {
+				cmd.Stderr = f
+				defer f.Close()
+			}
+		case "2>>":
+			f, err := os.OpenFile(r.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				cmd.Stderr = f
+				defer f.Close()
+			}
+		case "2>&1":
+			cmd.Stderr = cmd.Stdout
+		case "1>&2", ">&2":
+			cmd.Stdout = cmd.Stderr
+		case "<":
+			f, err := os.Open(r.File)
+			if err == nil {
+				cmd.Stdin = f
 				defer f.Close()
 			}
 		}

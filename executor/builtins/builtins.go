@@ -18,6 +18,16 @@ var Registry = map[string]Func{
 	"PAUSE": Pause,
 	"DIR":   Dir,
 	"REM":   Rem,
-	"TYPE":  Type,
-	"SHIFT": func(_ []string, _ *env.Env) int { return 0 }, // handled by executor directly
+	"TYPE":   Type,
+	"SHIFT":  func(_ []string, _ *env.Env) int { return 0 },
+	"DEL":    Del,
+	"ERASE":  Del,
+	"COPY":   Copy,
+	"MOVE":   Move,
+	"MKDIR":  Mkdir,
+	"MD":     Mkdir,
+	"RMDIR":  Rmdir,
+	"RD":     Rmdir,
+	"REN":    Ren,
+	"RENAME": Ren,
 }

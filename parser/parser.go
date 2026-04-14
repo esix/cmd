@@ -64,7 +64,7 @@ func (p *parser) parseStatements() ([]Statement, error) {
 
 // parseChain handles: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2
 func (p *parser) parseChain() (Statement, error) {
-	left, err := p.parseOne()
+	left, err := p.parsePipe()
 	if err != nil || left == nil {
 		return left, err
 	}
@@ -73,7 +73,7 @@ func (p *parser) parseChain() (Statement, error) {
 		if tok.Kind == lexer.AND || tok.Kind == lexer.OR || tok.Kind == lexer.AMPERSAND {
 			op := tok.Value
 			p.consume()
-			right, err := p.parseOne()
+			right, err := p.parsePipe()
 			if err != nil {
 				return nil, err
 			}
@@ -86,6 +86,29 @@ func (p *parser) parseChain() (Statement, error) {
 		}
 	}
 	return left, nil
+}
+
+// parsePipe handles: cmd1 | cmd2 | cmd3
+func (p *parser) parsePipe() (Statement, error) {
+	left, err := p.parseOne()
+	if err != nil || left == nil {
+		return left, err
+	}
+	if p.peek().Kind != lexer.PIPE {
+		return left, nil
+	}
+	cmds := []Statement{left}
+	for p.peek().Kind == lexer.PIPE {
+		p.consume()
+		right, err := p.parseOne()
+		if err != nil {
+			return nil, err
+		}
+		if right != nil {
+			cmds = append(cmds, right)
+		}
+	}
+	return &PipeStatement{Commands: cmds}, nil
 }
 
 func (p *parser) parseOne() (Statement, error) {
@@ -188,7 +211,17 @@ func (p *parser) parseEcho() (Statement, error) {
 	}
 
 	args := p.collectWordGroups()
-	return &EchoStatement{Args: args}, nil
+	// Collect any trailing redirections (e.g. ECHO error 1>&2)
+	var redirects []Redirect
+	for p.peek().Kind == lexer.REDIRECTION {
+		op := p.consume().Value
+		file := ""
+		if p.peek().Kind == lexer.WORD {
+			file = p.consume().Value
+		}
+		redirects = append(redirects, Redirect{Op: op, File: file})
+	}
+	return &EchoStatement{Args: args, Redirects: redirects}, nil
 }
 
 // --- SET ---
@@ -283,6 +316,12 @@ func (p *parser) parseCondition() (Condition, error) {
 			p.consume()
 			path := p.collectWordParts()
 			return &ExistCondition{Path: path}, nil
+		}
+
+		if upper == "DEFINED" {
+			p.consume()
+			name := p.consume().Value
+			return &DefinedCondition{Name: name}, nil
 		}
 
 		if upper == "ERRORLEVEL" {
@@ -531,6 +570,10 @@ func (p *parser) parseSimpleCommand() (Statement, error) {
 	for !p.atEnd() {
 		tok := p.peek()
 
+		if tok.Kind == lexer.PIPE || tok.Kind == lexer.RPAREN {
+			break
+		}
+
 		if tok.Kind == lexer.REDIRECTION {
 			p.consume()
 			file := ""
@@ -539,10 +582,6 @@ func (p *parser) parseSimpleCommand() (Statement, error) {
 			}
 			redirects = append(redirects, Redirect{Op: tok.Value, File: file})
 			continue
-		}
-
-		if tok.Kind == lexer.RPAREN {
-			break
 		}
 
 		p.consume()

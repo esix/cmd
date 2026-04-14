@@ -94,6 +94,20 @@ func ExpandPercent(line string, e *env.Env, positional []string) string {
 			continue
 		}
 
+		// %VAR:old=new% — string replacement
+		if colonIdx := strings.IndexByte(name, ':'); colonIdx != -1 {
+			eqIdx := strings.IndexByte(name[colonIdx+1:], '=')
+			if eqIdx != -1 {
+				varName := name[:colonIdx]
+				old := name[colonIdx+1 : colonIdx+1+eqIdx]
+				newStr := name[colonIdx+1+eqIdx+1:]
+				val := e.Get(varName)
+				sb.WriteString(strings.ReplaceAll(val, old, newStr))
+				i = closeIdx + 1
+				continue
+			}
+		}
+
 		// %VAR%
 		sb.WriteString(e.Get(name))
 		i = closeIdx + 1

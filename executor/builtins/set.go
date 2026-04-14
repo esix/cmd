@@ -44,11 +44,43 @@ func Set(args []string, e *env.Env) int {
 		}
 		name := strings.TrimSpace(raw[:eqIdx])
 		expr := strings.TrimSpace(raw[eqIdx+1:])
+
+		// Check for compound operators: +=, -=, *=, /=, %=
+		compoundOp := byte(0)
+		if len(name) > 0 {
+			last := name[len(name)-1]
+			if last == '+' || last == '-' || last == '*' || last == '/' || last == '%' {
+				compoundOp = last
+				name = strings.TrimSpace(name[:len(name)-1])
+			}
+		}
+
 		result, err := evalArith(expr, e)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "SET /A: %v\n", err)
 			return 1
 		}
+
+		if compoundOp != 0 {
+			current, _ := strconv.Atoi(e.Get(name))
+			switch compoundOp {
+			case '+':
+				result = current + result
+			case '-':
+				result = current - result
+			case '*':
+				result = current * result
+			case '/':
+				if result != 0 {
+					result = current / result
+				}
+			case '%':
+				if result != 0 {
+					result = current % result
+				}
+			}
+		}
+
 		e.Set(name, strconv.Itoa(result))
 		return 0
 	}

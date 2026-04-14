@@ -151,7 +151,11 @@ func expandSubstring(pt *parser.SubstringVarPart, e *env.Env) string {
 	return val[start:end]
 }
 
-// expandBangs expands !VAR! patterns in a string (delayed expansion).
+// ExpandBangs expands !VAR! patterns in a string (delayed expansion).
+func ExpandBangs(s string, e *env.Env) string {
+	return expandBangs(s, e)
+}
+
 func expandBangs(s string, e *env.Env) string {
 	var sb strings.Builder
 	i := 0

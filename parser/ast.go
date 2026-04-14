@@ -22,6 +22,14 @@ type Redirect struct {
 	File string
 }
 
+// --- Pipe: cmd1 | cmd2 ---
+
+type PipeStatement struct {
+	Commands []Statement
+}
+
+func (*PipeStatement) statementNode() {}
+
 // --- Chain: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2 ---
 
 type ChainStatement struct {
@@ -75,6 +83,10 @@ type ExistCondition struct{ Path []WordPart }
 
 func (*ExistCondition) conditionNode() {}
 
+type DefinedCondition struct{ Name string }
+
+func (*DefinedCondition) conditionNode() {}
+
 type ErrorlevelCondition struct{ N int }
 
 func (*ErrorlevelCondition) conditionNode() {}
@@ -111,9 +123,10 @@ func (*SetStatement) statementNode() {}
 // --- ECHO ---
 
 type EchoStatement struct {
-	Args    [][]WordPart
-	TurnOn  *bool // nil = not a toggle; true = ECHO ON, false = ECHO OFF
-	Newline bool  // ECHO. prints a blank line
+	Args      [][]WordPart
+	Redirects []Redirect
+	TurnOn    *bool // nil = not a toggle; true = ECHO ON, false = ECHO OFF
+	Newline   bool  // ECHO. prints a blank line
 }
 
 func (*EchoStatement) statementNode() {}
