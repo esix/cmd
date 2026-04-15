@@ -39,6 +39,17 @@ func New() *Env {
 			e.vars[strings.ToUpper(parts[0])] = parts[1]
 		}
 	}
+	// Map Windows env vars to Unix equivalents
+	if e.vars["TEMP"] == "" {
+		if tmpdir := os.Getenv("TMPDIR"); tmpdir != "" {
+			e.vars["TEMP"] = strings.TrimSuffix(tmpdir, "/")
+		} else {
+			e.vars["TEMP"] = "/tmp"
+		}
+	}
+	if e.vars["TMP"] == "" {
+		e.vars["TMP"] = e.vars["TEMP"]
+	}
 	return e
 }
 

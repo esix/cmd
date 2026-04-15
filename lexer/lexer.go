@@ -226,7 +226,15 @@ func (l *lexer) readWord() Token {
 		ch := l.input[l.pos]
 
 		// stop at unquoted delimiters
-		if ch == ' ' || ch == '\t' || ch == '|' || ch == '(' || ch == ')' {
+		if ch == ' ' || ch == '\t' || ch == '|' {
+			break
+		}
+		if ch == ')' {
+			break
+		}
+		// ( is a delimiter only at start of a token. Mid-word ( is literal
+		// (allows echo(text pattern used in BAT for safe echo)
+		if ch == '(' && sb.Len() == 0 {
 			break
 		}
 		if ch == '&' {

@@ -31,5 +31,7 @@ var Registry = map[string]Func{
 	"RMDIR":  Rmdir,
 	"RD":     Rmdir,
 	"REN":    Ren,
-	"RENAME": Ren,
+	"RENAME":   Ren,
+	"CERTUTIL": Certutil,
+	"CMD":      Cmd,
 }

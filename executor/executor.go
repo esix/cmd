@@ -2,6 +2,7 @@
 package executor
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"os"
@@ -22,12 +23,19 @@ type scriptLine struct {
 	label string // non-empty if this is a :LABEL line (uppercased, without colon)
 }
 
+// scriptFile is a preprocessed BAT file with label index for O(1) GOTO.
+type scriptFile struct {
+	lines    []scriptLine
+	labelIdx map[string]int // label name → line index
+}
+
 // Executor runs a list of statements with a program counter (for GOTO support).
 type Executor struct {
 	env        *env.Env
 	positional []string // %0, %1, ... script arguments
 	stmts      []parser.Statement // used by RunStmts (interactive / inline)
 	lines      []scriptLine       // used by RunFile (lazy parsing)
+	labelIdx   map[string]int     // label name → line index for O(1) GOTO
 	pc         int                // current line or statement index
 	gotoPending bool // true when GOTO was executed in a nested context
 	exitPending bool // true when EXIT /B was executed in a nested context
@@ -78,18 +86,20 @@ func (ex *Executor) RunLine(line string) int {
 
 // fileCache caches preprocessed script lines to avoid re-reading and
 // re-processing the same .bat file on every CALL.
-// fileCache caches preprocessed script lines.
-var fileCache = make(map[string][]scriptLine)
+// fileCache is disabled to debug EXIT /B issues
+var fileCache = map[string]*scriptFile{}
 
 // RunFile executes a .bat file. Lines are parsed on-the-fly so that
 // SETLOCAL EnableDelayedExpansion takes effect for subsequent lines.
 func (ex *Executor) RunFile(path string, args []string) int {
+	// Convert Windows backslash paths to Unix
+	path = strings.ReplaceAll(path, "\\", "/")
 	// Resolve to absolute path for cache key
 	absPath, _ := filepath.Abs(path)
 
-	slines, cached := fileCache[absPath]
-	if cached {
-		return ex.runLines(slines, path, args)
+	// Cache disabled for debugging
+	if sf, cached := fileCache[absPath]; cached {
+		return ex.runLines(sf.lines, sf.labelIdx, path, args)
 	}
 
 	data, err := os.ReadFile(path)
@@ -100,7 +110,7 @@ func (ex *Executor) RunFile(path string, args []string) int {
 
 	// Pre-process lines: classify as label or code, skip blanks and REM
 	rawLines := strings.Split(string(data), "\n")
-	slines = nil
+	var slines []scriptLine
 	for _, line := range rawLines {
 		line = strings.TrimRight(line, "\r")
 		if strings.TrimSpace(line) == "" {
@@ -146,21 +156,29 @@ func (ex *Executor) RunFile(path string, args []string) int {
 	// Join multi-line ( ... ) blocks into single lines using & as separator
 	slines = joinBlocks(slines)
 
-	// Cache for future calls
-	fileCache[absPath] = slines
+	// Build label index for O(1) GOTO
+	labelIdx := make(map[string]int, 32)
+	for i, sl := range slines {
+		if sl.label != "" {
+			labelIdx[sl.label] = i
+		}
+	}
 
-	return ex.runLines(slines, path, args)
+	fileCache[absPath] = &scriptFile{lines: slines, labelIdx: labelIdx}
+	return ex.runLines(slines, labelIdx, path, args)
 }
 
 
-func (ex *Executor) runLines(slines []scriptLine, path string, args []string) int {
+func (ex *Executor) runLines(slines []scriptLine, labelIdx map[string]int, path string, args []string) int {
 	ex.env.FileMode = true
 	savedPos := ex.positional
 	ex.positional = append([]string{path}, args...)
 
 	savedLines := ex.lines
+	savedLabels := ex.labelIdx
 	savedPC := ex.pc
 	ex.lines = slines
+	ex.labelIdx = labelIdx
 	ex.pc = 0
 
 	code := 0
@@ -172,6 +190,8 @@ func (ex *Executor) runLines(slines []scriptLine, path string, args []string) in
 			continue // labels are no-ops during execution
 		}
 
+		{
+			}
 		// Parse with current delayed expansion state
 		expanded := expander.ExpandPercent(sl.raw, ex.env, ex.positional)
 		stmts, err := parser.ParseLineWithOpts(expanded, ex.env.DelayedExpansion)
@@ -188,13 +208,18 @@ func (ex *Executor) runLines(slines []scriptLine, path string, args []string) in
 			}
 			if ex.exitPending {
 				ex.exitPending = false
-				ex.pc = len(ex.lines) // stop file execution
+				ex.pc = len(ex.lines)
+				break
+			}
+			// Also check if pc was moved past end by EXIT /B in a chain
+			if ex.pc >= len(ex.lines) {
 				break
 			}
 		}
 	}
 
 	ex.lines = savedLines
+	ex.labelIdx = savedLabels
 	ex.pc = savedPC
 	ex.positional = savedPos
 	return code
@@ -281,7 +306,7 @@ func (ex *Executor) execPipe(s *parser.PipeStatement) int {
 
 	// Build pipe chain: create all intermediate pipes
 	n := len(s.Commands)
-	pipes := make([]io.ReadCloser, n-1) // pipes[i] = stdout of command i
+	pipes := make([]io.ReadCloser, n-1)
 	writers := make([]io.WriteCloser, n-1)
 	for i := 0; i < n-1; i++ {
 		r, w, err := os.Pipe()
@@ -327,7 +352,6 @@ func (ex *Executor) execPipe(s *parser.PipeStatement) int {
 		codes[r.index] = r.code
 	}
 
-	// Close read ends
 	for _, r := range pipes {
 		r.Close()
 	}
@@ -444,19 +468,18 @@ func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 	// Handle redirections (e.g. ECHO error 1>&2)
 	out := os.Stdout
 	for _, r := range s.Redirects {
+		file := cleanRedirectFile(r.File, ex.env)
 		switch r.Op {
 		case "1>&2", ">&2":
 			out = os.Stderr
 		case ">", "1>":
-			f, err := os.Create(r.File)
+			f, err := os.Create(file)
 			if err == nil {
-				defer f.Close()
 				out = f
 			}
 		case ">>", "1>>":
-			f, err := os.OpenFile(r.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
-				defer f.Close()
 				out = f
 			}
 		}
@@ -492,6 +515,33 @@ func (ex *Executor) execSet(s *parser.SetStatement) int {
 			value = expander.ExpandBangs(value, ex.env)
 		}
 		return builtins.Set([]string{"/A", s.Name + "=" + value}, ex.env)
+	}
+
+	if s.Prompt {
+		// SET /P var=prompt — read a line from stdin (or redirected file)
+		prompt := value
+		input := os.Stdin
+		for _, r := range s.Redirects {
+			if r.Op == "<" {
+				file := cleanRedirectFile(r.File, ex.env)
+				f, err := os.Open(file)
+				if err == nil {
+					input = f
+				}
+			}
+		}
+		if prompt != "" && input == os.Stdin {
+			fmt.Print(prompt)
+		}
+		reader := bufio.NewReader(input)
+		line, err := reader.ReadString('\n')
+		line = strings.TrimRight(line, "\r\n")
+		if err != nil && line == "" {
+			ex.env.Unset(s.Name)
+		} else {
+			ex.env.Set(s.Name, line)
+		}
+		return 0
 	}
 
 	if !s.HasEquals {
@@ -603,16 +653,28 @@ func (ex *Executor) execGoto(s *parser.GotoStatement) int {
 		return 0
 	}
 
-	// Search in file lines (lazy-parse mode)
+	// Search in file lines using label index (O(1) lookup)
 	if ex.lines != nil {
+		if idx, ok := ex.labelIdx[label]; ok {
+			ex.pc = idx + 1
+			ex.gotoPending = true
+			return 0
+		}
+		fmt.Fprintf(os.Stderr, "GOTO-DBG: label %q not in index (len=%d), lines=%d. Index keys:", label, len(ex.labelIdx), len(ex.lines))
+		for k := range ex.labelIdx {
+			fmt.Fprintf(os.Stderr, " %s", k)
+		}
+		fmt.Fprintln(os.Stderr)
+		// Fallback: linear scan
 		for i, sl := range ex.lines {
 			if sl.label == label {
+				fmt.Fprintf(os.Stderr, "GOTO-DBG: found %q at line %d via linear scan!\n", label, i)
 				ex.pc = i + 1
-				ex.gotoPending = true // signal RunStmts to break out
+				ex.gotoPending = true
 				return 0
 			}
 		}
-		fmt.Fprintf(os.Stderr, "Label not found: %s\n", s.Label)
+		fmt.Fprintf(os.Stderr, "Label not found: %s\n", label)
 		return 1
 	}
 
@@ -652,9 +714,8 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 		ex.positional = callArgs
 
 		if ex.lines != nil {
-			for i, sl := range ex.lines {
-				if sl.label == label {
-					ex.pc = i + 1
+			if idx, ok := ex.labelIdx[label]; ok {
+					ex.pc = idx + 1
 					code := 0
 					for ex.pc < len(ex.lines) {
 						sl := ex.lines[ex.pc]
@@ -692,7 +753,6 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 					ex.positional = savedPos
 					return code
 				}
-			}
 		} else {
 			for i, stmt := range ex.stmts {
 				if lbl, ok := stmt.(*parser.LabelStatement); ok && lbl.Name == label {
@@ -722,6 +782,8 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 	scriptPath := first
 	if resolved, ok := ex.resolveBat(scriptPath); ok {
 		scriptPath = resolved
+	}
+	if os.Getenv("CMD_DEBUG") != "" {
 	}
 	var scriptArgs []string
 	for _, part := range s.Args[1:] {
@@ -987,17 +1049,24 @@ func (ex *Executor) execSimple(s *parser.SimpleCommand) int {
 		return 0
 	}
 
-	// Expand all args
+	// Expand all args, strip quotes, and convert backslash paths
 	args := make([]string, 0, len(s.Args))
 	for _, part := range s.Args {
-		args = append(args, ex.expandParts([]parser.WordPart{part}))
+		a := ex.expandParts([]parser.WordPart{part})
+		a = strings.Trim(a, "\"")
+		a = strings.ReplaceAll(a, "\\", "/")
+		args = append(args, a)
 	}
 
 	cmdName := strings.ToUpper(args[0])
 
 	// Builtin?
 	if fn, ok := builtins.Registry[cmdName]; ok {
-		return fn(args[1:], ex.env)
+		// Apply redirections for builtins (e.g. cmd /C >file echo text)
+		cleanup := ex.applyRedirects(s.Redirects)
+		code := fn(args[1:], ex.env)
+		cleanup()
+		return code
 	}
 
 	// .bat file typed directly (e.g. "myscript.bat" or "myscript")
@@ -1011,16 +1080,16 @@ func (ex *Executor) execSimple(s *parser.SimpleCommand) int {
 }
 
 func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int {
+	// Convert backslash paths
+	args[0] = strings.ReplaceAll(args[0], "\\", "/")
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
-	// Apply redirections (translate Windows nul → /dev/null)
+	// Normalize redirect file paths
 	for i := range redirects {
-		if strings.ToLower(redirects[i].File) == "nul" {
-			redirects[i].File = "/dev/null"
-		}
+		redirects[i].File = cleanRedirectFile(redirects[i].File, ex.env)
 	}
 	for _, r := range redirects {
 		switch r.Op {
@@ -1028,25 +1097,21 @@ func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int 
 			f, err := os.Create(r.File)
 			if err == nil {
 				cmd.Stdout = f
-				defer f.Close()
 			}
 		case ">>", "1>>":
 			f, err := os.OpenFile(r.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
 				cmd.Stdout = f
-				defer f.Close()
 			}
 		case "2>":
 			f, err := os.Create(r.File)
 			if err == nil {
 				cmd.Stderr = f
-				defer f.Close()
 			}
 		case "2>>":
 			f, err := os.OpenFile(r.File, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 			if err == nil {
 				cmd.Stderr = f
-				defer f.Close()
 			}
 		case "2>&1":
 			cmd.Stderr = cmd.Stdout
@@ -1056,7 +1121,6 @@ func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int 
 			f, err := os.Open(r.File)
 			if err == nil {
 				cmd.Stdin = f
-				defer f.Close()
 			}
 		}
 	}
@@ -1074,15 +1138,21 @@ func (ex *Executor) runExternal(args []string, redirects []parser.Redirect) int 
 // joinBlocks merges multi-line parenthesized blocks into single lines.
 // e.g. "if cond (\n  cmd1\n  cmd2\n)" becomes "if cond ( cmd1 & cmd2 )"
 // countUnquotedParens counts ( and ) outside of quoted strings.
+// Excludes echo( pattern where ( is not a block delimiter.
 func countUnquotedParens(line string) int {
 	depth := 0
 	inQuote := false
+	upper := strings.ToUpper(line)
 	for i := 0; i < len(line); i++ {
 		switch line[i] {
 		case '"':
 			inQuote = !inQuote
 		case '(':
 			if !inQuote {
+				// Skip echo( pattern — the ( is part of echo, not a block
+				if i >= 4 && upper[i-4:i] == "ECHO" {
+					continue
+				}
 				depth++
 			}
 		case ')':
@@ -1143,10 +1213,16 @@ func joinBlocks(lines []scriptLine) []scriptLine {
 // resolveBat checks if name refers to a .bat file (with or without extension).
 // Returns the resolved path and true if found.
 func (ex *Executor) resolveBat(name string) (string, bool) {
-	candidates := []string{name}
+	name = strings.ReplaceAll(name, "\\", "/")
 	lower := strings.ToLower(name)
-	if !strings.HasSuffix(lower, ".bat") && !strings.HasSuffix(lower, ".cmd") {
-		candidates = append(candidates, name+".bat", name+".cmd")
+	hasBatExt := strings.HasSuffix(lower, ".bat") || strings.HasSuffix(lower, ".cmd")
+
+	// Only check the exact name if it already has a .bat/.cmd extension
+	var candidates []string
+	if hasBatExt {
+		candidates = []string{name}
+	} else {
+		candidates = []string{name + ".bat", name + ".cmd"}
 	}
 
 	// Check CWD first
@@ -1172,6 +1248,69 @@ func (ex *Executor) resolveBat(name string) (string, bool) {
 		}
 	}
 	return "", false
+}
+
+// cleanRedirectFile normalizes a redirect target path.
+func cleanRedirectFile(file string, e *env.Env) string {
+	file = strings.Trim(file, "\"")
+	// Expand !VAR! in redirect paths when delayed expansion is on
+	if e != nil && e.DelayedExpansion {
+		file = expander.ExpandBangs(file, e)
+	}
+	// Convert backslashes AFTER expansion (expanded path may contain \)
+	file = strings.ReplaceAll(file, "\\", "/")
+	if strings.ToLower(file) == "nul" {
+		file = "/dev/null"
+	}
+	return file
+}
+
+// applyRedirects temporarily redirects os.Stdout/Stderr for builtin commands.
+// Returns a cleanup function that restores the originals.
+func (ex *Executor) applyRedirects(redirects []parser.Redirect) func() {
+	if len(redirects) == 0 {
+		return func() {}
+	}
+
+	savedOut := os.Stdout
+	savedErr := os.Stderr
+	var files []*os.File
+
+	for _, r := range redirects {
+		file := cleanRedirectFile(r.File, ex.env)
+		switch r.Op {
+		case ">", "1>":
+			f, err := os.Create(file)
+			if err == nil {
+				os.Stdout = f
+				files = append(files, f)
+			}
+		case ">>", "1>>":
+			f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+			if err == nil {
+				os.Stdout = f
+				files = append(files, f)
+			}
+		case "2>":
+			f, err := os.Create(file)
+			if err == nil {
+				os.Stderr = f
+				files = append(files, f)
+			}
+		case "1>&2", ">&2":
+			os.Stdout = os.Stderr
+		case "2>&1":
+			os.Stderr = os.Stdout
+		}
+	}
+
+	return func() {
+		os.Stdout = savedOut
+		os.Stderr = savedErr
+		for _, f := range files {
+			f.Close()
+		}
+	}
 }
 
 // --- Helpers ---

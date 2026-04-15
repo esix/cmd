@@ -113,7 +113,8 @@ func (*CallStatement) statementNode() {}
 type SetStatement struct {
 	Name       string
 	Value      [][]WordPart // word groups, joined with " " (preserves spaces)
-	HasEquals  bool         // true if = was present (distinguishes set to empty from display)
+	Redirects  []Redirect   // for SET /P with < file
+	HasEquals  bool         // true if = was present
 	Arithmetic bool         // SET /A
 	Prompt     bool         // SET /P
 }

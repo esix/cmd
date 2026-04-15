@@ -255,6 +255,34 @@ func (p *parser) parseSet() (Statement, error) {
 	raw = stripQuotes(raw)
 
 	eqIdx := strings.IndexByte(raw, '=')
+
+	// For SET /A with spaces: "set /a ii = 2 * i"
+	// The = may be a separate token. Collect all tokens as the expression.
+	if eqIdx == -1 && arithmetic {
+		// Collect rest: raw + remaining tokens form the full expression
+		var exprParts []string
+		exprParts = append(exprParts, raw)
+		for !p.atEnd() {
+			tok := p.peek()
+			if tok.Kind == lexer.REDIRECTION {
+				break
+			}
+			p.consume()
+			exprParts = append(exprParts, tok.Value)
+		}
+		fullExpr := strings.Join(exprParts, "")
+		eqIdx = strings.IndexByte(fullExpr, '=')
+		if eqIdx == -1 {
+			return &SetStatement{Name: fullExpr, Arithmetic: true}, nil
+		}
+		name := strings.TrimSpace(fullExpr[:eqIdx])
+		value := strings.TrimSpace(fullExpr[eqIdx+1:])
+		return &SetStatement{
+			Name: name, Value: [][]WordPart{{&LiteralPart{Text: value}}},
+			HasEquals: true, Arithmetic: true,
+		}, nil
+	}
+
 	if eqIdx == -1 {
 		return &SetStatement{Name: raw, Arithmetic: arithmetic, Prompt: prompt}, nil
 	}
@@ -264,21 +292,40 @@ func (p *parser) parseSet() (Statement, error) {
 
 	var valueGroups [][]WordPart
 	if valueStr != "" {
-		valueGroups = append(valueGroups, parseWordParts(valueStr))
-	}
-	valueGroups = append(valueGroups, p.collectWordGroups()...)
-
-	// Consume trailing redirections (e.g. SET /A "d=1" 2>nul)
-	for p.peek().Kind == lexer.REDIRECTION {
-		p.consume() // redirect op
-		if p.peek().Kind == lexer.WORD {
-			p.consume() // redirect target
+		initParts := parseWordParts(valueStr)
+		// If next token is adjacent (no space), merge it with the initial value
+		// This handles: SET acc=VAR_!x! where !x! immediately follows VAR_
+		if !p.atEnd() && !p.peek().SpaceBefore && p.peek().Kind != lexer.REDIRECTION {
+			groups := p.collectWordGroups()
+			if len(groups) > 0 {
+				initParts = append(initParts, groups[0]...)
+				groups = groups[1:]
+			}
+			valueGroups = append(valueGroups, initParts)
+			valueGroups = append(valueGroups, groups...)
+		} else {
+			valueGroups = append(valueGroups, initParts)
+			valueGroups = append(valueGroups, p.collectWordGroups()...)
 		}
+	} else {
+		valueGroups = append(valueGroups, p.collectWordGroups()...)
+	}
+
+	// Collect trailing redirections (e.g. SET /A "d=1" 2>nul, SET /P var= < file)
+	var redirects []Redirect
+	for p.peek().Kind == lexer.REDIRECTION {
+		op := p.consume().Value
+		file := ""
+		if p.peek().Kind == lexer.WORD {
+			file = p.consume().Value
+		}
+		redirects = append(redirects, Redirect{Op: op, File: file})
 	}
 
 	return &SetStatement{
 		Name:       name,
 		Value:      valueGroups,
+		Redirects:  redirects,
 		HasEquals:  true,
 		Arithmetic: arithmetic,
 		Prompt:     prompt,
@@ -661,6 +708,10 @@ func (p *parser) collectOneWordParts() []WordPart {
 			break
 		}
 		if !first && tok.SpaceBefore {
+			break
+		}
+		// Don't merge == into the operand — it's the comparison operator
+		if !first && tok.Kind == lexer.WORD && strings.HasPrefix(tok.Value, "==") {
 			break
 		}
 		p.consume()
