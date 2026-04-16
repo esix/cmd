@@ -2,7 +2,6 @@ package repl
 
 import (
 	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/chzyer/readline"
@@ -41,12 +40,20 @@ func buildItems() []readline.PrefixCompleterInterface {
 }
 
 // fileCompleter returns file/dir names matching the given prefix.
+// Paths use backslash separators to match Windows cmd.exe style.
 func fileCompleter(prefix string) []string {
-	dir := filepath.Dir(prefix)
-	base := filepath.Base(prefix)
-	if prefix == "" || strings.HasSuffix(prefix, "/") {
-		dir = prefix
-		base = ""
+	// Convert backslashes to forward slashes for OS filesystem calls
+	osPrefix := strings.ReplaceAll(prefix, "\\", "/")
+
+	// Split into directory and partial filename
+	dir := "."
+	base := osPrefix
+	if i := strings.LastIndex(osPrefix, "/"); i >= 0 {
+		dir = osPrefix[:i]
+		base = osPrefix[i+1:]
+		if dir == "" {
+			dir = "/"
+		}
 	}
 
 	entries, err := os.ReadDir(dir)
@@ -60,9 +67,17 @@ func fileCompleter(prefix string) []string {
 		if !strings.HasPrefix(strings.ToLower(name), strings.ToLower(base)) {
 			continue
 		}
-		full := filepath.Join(dir, name)
+		// Build path with backslash separators (Windows cmd style)
+		var full string
+		if dir == "." {
+			full = name
+		} else {
+			full = dir + "/" + name
+		}
+		// Convert to backslash
+		full = strings.ReplaceAll(full, "/", "\\")
 		if e.IsDir() {
-			full += "/"
+			full += "\\"
 		}
 		matches = append(matches, full)
 	}

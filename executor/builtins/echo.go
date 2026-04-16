@@ -14,12 +14,12 @@ import (
 func Echo(args []string, e *env.Env) int {
 	if len(args) == 0 {
 		if e.Echo {
-			fmt.Println("ECHO is on.")
+			fmt.Print("ECHO is on.\r\n")
 		} else {
-			fmt.Println("ECHO is off.")
+			fmt.Print("ECHO is off.\r\n")
 		}
 		return 0
 	}
-	fmt.Println(strings.Join(args, " "))
+	fmt.Print(strings.Join(args, " ") + "\r\n")
 	return 0
 }

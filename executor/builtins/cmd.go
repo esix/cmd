@@ -45,12 +45,12 @@ func Cmd(args []string, e *env.Env) int {
 		// The first arg might be just "echo(" with text in the next arg
 		text := cmdStr[echoIdx:]
 		text = strings.TrimLeft(text, " ") // remove artifact space from arg joining
-		fmt.Println(text)
+		fmt.Print(text + "\r\n")
 		return 0
 	}
 
 	if strings.HasPrefix(strings.ToUpper(cmdStr), "ECHO ") {
-		fmt.Println(cmdStr[5:])
+		fmt.Print(cmdStr[5:] + "\r\n")
 		return 0
 	}
 

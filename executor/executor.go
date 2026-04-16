@@ -64,9 +64,9 @@ func (ex *Executor) RunLine(line string) int {
 	if strings.ToUpper(strings.TrimSpace(line)) == "ECHO." ||
 		strings.HasPrefix(strings.ToUpper(strings.TrimSpace(line)), "ECHO.") {
 		if echoLine && ex.env.Echo {
-			fmt.Println(strings.TrimSpace(line))
+			fmt.Print(strings.TrimSpace(line) + "\r\n")
 		}
-		fmt.Println()
+		fmt.Print("\r\n")
 		return 0
 	}
 
@@ -454,7 +454,7 @@ func (ex *Executor) execShift() int {
 
 func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 	if s.Newline {
-		fmt.Println()
+		fmt.Print("\r\n")
 		return 0
 	}
 	if s.TurnOn != nil {
@@ -486,13 +486,13 @@ func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 	}
 	if len(words) == 0 {
 		if ex.env.Echo {
-			fmt.Fprintln(out, "ECHO is on.")
+			fmt.Fprint(out, "ECHO is on.\r\n")
 		} else {
-			fmt.Fprintln(out, "ECHO is off.")
+			fmt.Fprint(out, "ECHO is off.\r\n")
 		}
 		return 0
 	}
-	fmt.Fprintln(out, strings.Join(words, " "))
+	fmt.Fprint(out, strings.Join(words, " ")+"\r\n")
 	return 0
 }
 

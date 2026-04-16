@@ -51,7 +51,6 @@ func certutilEncodeHex(args []string) int {
 		fmt.Fprintf(os.Stderr, "certutil: cannot read %s: %v\n", inFile, err)
 		return 1
 	}
-
 	var output string
 	switch encType {
 	case 12:
