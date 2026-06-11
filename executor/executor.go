@@ -46,6 +46,19 @@ func (ex *Executor) shouldStop() bool {
 	return ex.gotoPending || ex.exitPending
 }
 
+// updatesErrorlevel reports whether a statement should update %ERRORLEVEL%
+// after execution. Builtins like ECHO, SET, IF, FOR don't touch errorlevel
+// in real cmd.exe; only external commands, CALL, and EXIT do.
+func updatesErrorlevel(stmt parser.Statement) bool {
+	switch stmt.(type) {
+	case *parser.EchoStatement, *parser.SetStatement, *parser.IfStatement,
+		*parser.ForStatement, *parser.SetlocalStatement, *parser.EndlocalStatement,
+		*parser.LabelStatement, *parser.ShiftStatement, *parser.GotoStatement:
+		return false
+	}
+	return true
+}
+
 // New creates an Executor.
 func New(e *env.Env) *Executor {
 	return &Executor{env: e}
@@ -97,7 +110,6 @@ func (ex *Executor) RunFile(path string, args []string) int {
 	// Resolve to absolute path for cache key
 	absPath, _ := filepath.Abs(path)
 
-	// Cache disabled for debugging
 	if sf, cached := fileCache[absPath]; cached {
 		return ex.runLines(sf.lines, sf.labelIdx, path, args)
 	}
@@ -110,6 +122,7 @@ func (ex *Executor) RunFile(path string, args []string) int {
 
 	// Pre-process lines: classify as label or code, skip blanks and REM
 	rawLines := strings.Split(string(data), "\n")
+	rawLines = joinCaretContinuations(rawLines)
 	var slines []scriptLine
 	for _, line := range rawLines {
 		line = strings.TrimRight(line, "\r")
@@ -201,7 +214,9 @@ func (ex *Executor) runLines(slines []scriptLine, labelIdx map[string]int, path 
 		}
 		for _, stmt := range stmts {
 			code = ex.execute(stmt)
-			ex.env.ExitCode = code
+			if updatesErrorlevel(stmt) {
+				ex.env.ExitCode = code
+			}
 			if ex.gotoPending {
 				ex.gotoPending = false
 				break
@@ -233,7 +248,11 @@ func (ex *Executor) RunStmts(stmts []parser.Statement, positional []string) int 
 
 	ex.stmts = stmts
 	ex.pc = 0
-	if positional != nil {
+	// Only override positional when a fresh set is supplied (e.g. CALL).
+	// When nil, we share the parent's positional so SHIFT inside an IF/FOR
+	// block persists to the enclosing scope (matches cmd.exe behavior).
+	overrodePositional := positional != nil
+	if overrodePositional {
 		ex.positional = positional
 	}
 
@@ -242,7 +261,9 @@ func (ex *Executor) RunStmts(stmts []parser.Statement, positional []string) int 
 		stmt := ex.stmts[ex.pc]
 		ex.pc++
 		code = ex.execute(stmt)
-		ex.env.ExitCode = code
+		if updatesErrorlevel(stmt) {
+			ex.env.ExitCode = code
+		}
 		if ex.shouldStop() {
 			break
 		}
@@ -252,7 +273,11 @@ func (ex *Executor) RunStmts(stmts []parser.Statement, positional []string) int 
 	if !ex.gotoPending && !ex.exitPending {
 		ex.pc = savedPC
 	}
-	ex.positional = savedPos
+	// Restore positional only if we overrode it; otherwise leave any SHIFT
+	// performed by the block in effect.
+	if overrodePositional {
+		ex.positional = savedPos
+	}
 	return code
 }
 
@@ -433,7 +458,9 @@ func (ex *Executor) execBlock(s *parser.BlockStatement) int {
 	code := 0
 	for _, stmt := range s.Stmts {
 		code = ex.execute(stmt)
-		ex.env.ExitCode = code
+		if updatesErrorlevel(stmt) {
+			ex.env.ExitCode = code
+		}
 		if ex.shouldStop() {
 			break
 		}
@@ -461,10 +488,7 @@ func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 		ex.env.Echo = *s.TurnOn
 		return 0
 	}
-	words := make([]string, 0, len(s.Args))
-	for _, group := range s.Args {
-		words = append(words, ex.expandParts(group))
-	}
+
 	// Handle redirections (e.g. ECHO error 1>&2)
 	out := os.Stdout
 	for _, r := range s.Redirects {
@@ -484,6 +508,20 @@ func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 			}
 		}
 	}
+
+	// Prefer verbatim text (preserves leading/internal spacing) when available.
+	if s.HasRaw {
+		// Expand !VAR! (delayed) and %%X FOR variables that survive line-level
+		// %VAR% expansion. ExpandName does bangs then nested-percent expansion.
+		text := expander.ExpandName(s.RawText, ex.env)
+		fmt.Fprint(out, text+"\r\n")
+		return 0
+	}
+
+	words := make([]string, 0, len(s.Args))
+	for _, group := range s.Args {
+		words = append(words, ex.expandParts(group))
+	}
 	if len(words) == 0 {
 		if ex.env.Echo {
 			fmt.Fprint(out, "ECHO is on.\r\n")
@@ -499,9 +537,15 @@ func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 // --- SET ---
 
 func (ex *Executor) execSet(s *parser.SetStatement) int {
-	if s.Name == "" {
+	// A bare `set` (no name, no /P, no /A) lists all variables. But
+	// `set /p "=prompt"` has an empty name on purpose (the print-no-newline
+	// idiom `<nul set /p "=text"`) — that must NOT trigger the listing.
+	if s.Name == "" && !s.Prompt && !s.Arithmetic {
 		return builtins.Set(nil, ex.env)
 	}
+	// The variable name may contain %%X (FOR var) / %VAR% / !VAR! references
+	// (e.g. `set "%%a=%%b"` inside a FOR body). Resolve them first.
+	name := expander.ExpandName(s.Name, ex.env)
 	// Expand each word group and join with spaces
 	words := make([]string, 0, len(s.Value))
 	for _, group := range s.Value {
@@ -514,44 +558,45 @@ func (ex *Executor) execSet(s *parser.SetStatement) int {
 		if ex.env.DelayedExpansion {
 			value = expander.ExpandBangs(value, ex.env)
 		}
-		return builtins.Set([]string{"/A", s.Name + "=" + value}, ex.env)
+		return builtins.Set([]string{"/A", name + "=" + value}, ex.env)
 	}
 
 	if s.Prompt {
-		// SET /P var=prompt — read a line from stdin (or redirected file)
+		// SET /P var=prompt — read a line from stdin (or redirected file).
+		// Output redirects (e.g. `> file <nul set /p "=text"`) must capture the
+		// prompt, so apply them around the prompt print. cmd.exe always prints
+		// the prompt (even with redirected stdin) and strips its leading
+		// whitespace.
 		prompt := value
-		input := os.Stdin
-		for _, r := range s.Redirects {
-			if r.Op == "<" {
-				file := cleanRedirectFile(r.File, ex.env)
-				f, err := os.Open(file)
-				if err == nil {
-					input = f
-				}
-			}
+		cleanup := ex.applyRedirects(s.Redirects)
+		promptOut := strings.TrimLeft(prompt, " \t")
+		if promptOut != "" {
+			fmt.Print(promptOut)
 		}
-		if prompt != "" && input == os.Stdin {
-			fmt.Print(prompt)
-		}
-		reader := bufio.NewReader(input)
+		reader := bufio.NewReader(os.Stdin)
 		line, err := reader.ReadString('\n')
 		line = strings.TrimRight(line, "\r\n")
+		cleanup()
+		// Empty name (e.g. `<nul set /p "=text"`) is prompt-only: don't assign.
+		if name == "" {
+			return 0
+		}
 		if err != nil && line == "" {
-			ex.env.Unset(s.Name)
+			ex.env.Unset(name)
 		} else {
-			ex.env.Set(s.Name, line)
+			ex.env.Set(name, line)
 		}
 		return 0
 	}
 
 	if !s.HasEquals {
 		// SET NAME without = → display the variable
-		return builtins.Set([]string{s.Name}, ex.env)
+		return builtins.Set([]string{name}, ex.env)
 	}
 	if value == "" {
-		ex.env.Unset(s.Name)
+		ex.env.Unset(name)
 	} else {
-		ex.env.Set(s.Name, value)
+		ex.env.Set(name, value)
 	}
 	return 0
 }
@@ -576,6 +621,9 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 	case *parser.StringCompare:
 		left := stripOuterQuotes(ex.expandParts(c.Left))
 		right := stripOuterQuotes(ex.expandParts(c.Right))
+		if c.CaseInsensitive {
+			return strings.EqualFold(left, right)
+		}
 		return left == right
 
 	case *parser.NumericCompare:
@@ -623,6 +671,22 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 
 	case *parser.ExistCondition:
 		path := ex.expandParts(c.Path)
+		path = stripOuterQuotes(path)
+		// Convert backslashes to forward slashes for OS calls
+		path = strings.ReplaceAll(path, "\\", "/")
+		// Strip drive letter
+		if len(path) >= 2 && path[1] == ':' {
+			if len(path) >= 3 && path[2] == '/' {
+				path = path[2:]
+			} else {
+				path = path[2:]
+			}
+		}
+		// Trailing slash means directory
+		path = strings.TrimRight(path, "/")
+		if path == "" {
+			path = "."
+		}
 		_, err := os.Stat(path)
 		return err == nil
 
@@ -697,13 +761,26 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 	if len(s.Args) == 0 {
 		return 0
 	}
-	first := ex.expandParts([]parser.WordPart{s.Args[0]})
+	// Apply any output redirections for the whole CALL (e.g. CALL foo > out).
+	if len(s.Redirects) > 0 {
+		cleanup := ex.applyRedirects(s.Redirects)
+		defer cleanup()
+	}
+	first := ex.expandParts(s.Args[0])
 
-	// Expand remaining args as positional params for the call
+	// Expand remaining args as positional params for the call. An unquoted
+	// expansion that yields spaces (e.g. `call :x !list!` where list="2 3")
+	// splits into multiple positional params, matching cmd.exe; quoted
+	// expansions stay a single arg (splitArgs respects quotes).
 	var callArgs []string
 	callArgs = append(callArgs, first) // %0 = label or script name
 	for _, arg := range s.Args[1:] {
-		callArgs = append(callArgs, ex.expandParts([]parser.WordPart{arg}))
+		expanded := ex.expandParts(arg)
+		if parts := splitArgs(expanded); len(parts) > 0 {
+			callArgs = append(callArgs, parts...)
+		} else {
+			callArgs = append(callArgs, expanded)
+		}
 	}
 
 	// CALL :label — subroutine within same file
@@ -731,7 +808,7 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 						done := false
 						for _, stmt := range stmts {
 							if exitStmt, ok := stmt.(*parser.ExitStatement); ok && exitStmt.SubOnly {
-								code = exitStmt.Code
+								code = ex.execExit(exitStmt)
 								done = true
 								break
 							}
@@ -762,7 +839,8 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 						stmt := ex.stmts[ex.pc]
 						ex.pc++
 						if exitStmt, ok := stmt.(*parser.ExitStatement); ok && exitStmt.SubOnly {
-							code = exitStmt.Code
+							code = ex.execExit(exitStmt)
+							ex.exitPending = false
 							break
 						}
 						code = ex.execute(stmt)
@@ -783,12 +861,8 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 	if resolved, ok := ex.resolveBat(scriptPath); ok {
 		scriptPath = resolved
 	}
-	if os.Getenv("CMD_DEBUG") != "" {
-	}
-	var scriptArgs []string
-	for _, part := range s.Args[1:] {
-		scriptArgs = append(scriptArgs, ex.expandParts([]parser.WordPart{part}))
-	}
+	// Reuse the already-split positional args (callArgs[0] is the script name).
+	scriptArgs := callArgs[1:]
 
 	sub := &Executor{env: ex.env}
 	return sub.RunFile(scriptPath, scriptArgs)
@@ -804,10 +878,71 @@ func (ex *Executor) execFor(s *parser.ForStatement) int {
 		return ex.execForInList(s)
 	case parser.ForTokens:
 		return ex.execForTokens(s)
+	case parser.ForDirs:
+		return ex.execForDirs(s)
+	case parser.ForRecursive:
+		return ex.execForRecursive(s)
 	default:
 		fmt.Fprintf(os.Stderr, "FOR variant not yet implemented\n")
 		return 1
 	}
+}
+
+// execForDirs handles FOR /D %%v IN (pattern) DO ...
+// Iterates over directories matching the pattern.
+func (ex *Executor) execForDirs(s *parser.ForStatement) int {
+	code := 0
+	for _, item := range s.InList {
+		// Expand !VAR! and strip outer quotes; convert backslashes for OS calls
+		item = expander.ExpandBangs(item, ex.env)
+		item = stripOuterQuotes(item)
+		pattern := strings.ReplaceAll(item, "\\", "/")
+		matches, _ := filepath.Glob(pattern)
+		for _, m := range matches {
+			info, err := os.Stat(m)
+			if err != nil || !info.IsDir() {
+				continue
+			}
+			ex.env.Set(s.Variable, m)
+			code = ex.RunStmts(s.Body, nil)
+			if ex.shouldStop() {
+				return code
+			}
+		}
+	}
+	return code
+}
+
+// execForRecursive handles FOR /R [path] %%v IN (pattern) DO ...
+// Walks the directory tree and matches files against pattern in each subdirectory.
+func (ex *Executor) execForRecursive(s *parser.ForStatement) int {
+	root := s.RootPath
+	if root == "" {
+		root = "."
+	}
+	root = strings.ReplaceAll(root, "\\", "/")
+	root = strings.Trim(root, "\"")
+
+	code := 0
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+		if err != nil || !info.IsDir() {
+			return nil
+		}
+		for _, item := range s.InList {
+			pattern := filepath.Join(path, strings.ReplaceAll(item, "\\", "/"))
+			matches, _ := filepath.Glob(pattern)
+			for _, m := range matches {
+				ex.env.Set(s.Variable, m)
+				code = ex.RunStmts(s.Body, nil)
+				if ex.shouldStop() {
+					return filepath.SkipDir
+				}
+			}
+		}
+		return nil
+	})
+	_ = err
+	return code
 }
 
 func (ex *Executor) execForRange(s *parser.ForStatement) int {
@@ -817,6 +952,9 @@ func (ex *Executor) execForRange(s *parser.ForStatement) int {
 		return 1
 	}
 	parseI := func(v string) int {
+		// Range bounds may be delayed-expansion refs (e.g. FOR /L in (1,1,!n!)).
+		// %VAR% is already expanded at line level; expand any !VAR! here.
+		v = expander.ExpandBangs(v, ex.env)
 		n := 0
 		fmt.Sscanf(strings.TrimSpace(v), "%d", &n)
 		return n
@@ -835,17 +973,41 @@ func (ex *Executor) execForRange(s *parser.ForStatement) int {
 
 func (ex *Executor) execForInList(s *parser.ForStatement) int {
 	code := 0
-	for _, item := range s.InList {
-		// Check if item is a glob pattern
-		if strings.ContainsAny(item, "*?") {
-			matches, _ := filepath.Glob(item)
-			for _, m := range matches {
-				ex.env.Set(s.Variable, m)
-				code = ex.RunStmts(s.Body, nil)
-			}
+	for _, rawItem := range s.InList {
+		// Expand delayed-expansion (!VAR!) then %%X FOR-variable refs, so an
+		// inner loop like `for %%p in (%%j)` sees the outer loop's value.
+		item := expander.ExpandBangs(rawItem, ex.env)
+		item = expander.ExpandForVars(item, ex.env)
+		// Item may now contain spaces from expansion; split into multiple items
+		// so that "for %%i in (!list!)" iterates each token of !list!.
+		// Empty expansion → no iterations.
+		if strings.TrimSpace(item) == "" {
+			continue
+		}
+		var items []string
+		if strings.ContainsAny(item, " \t") {
+			items = strings.Fields(item)
 		} else {
-			ex.env.Set(s.Variable, item)
-			code = ex.RunStmts(s.Body, nil)
+			items = []string{item}
+		}
+		for _, it := range items {
+			// Check if item is a glob pattern
+			if strings.ContainsAny(it, "*?") {
+				matches, _ := filepath.Glob(it)
+				for _, m := range matches {
+					ex.env.Set(s.Variable, m)
+					code = ex.RunStmts(s.Body, nil)
+					if ex.shouldStop() {
+						return code
+					}
+				}
+			} else {
+				ex.env.Set(s.Variable, it)
+				code = ex.RunStmts(s.Body, nil)
+				if ex.shouldStop() {
+					return code
+				}
+			}
 		}
 	}
 	return code
@@ -867,27 +1029,70 @@ func parseForFOpts(optStr string) forFOpts {
 		eol:    ';',            // default: semicolon
 	}
 	optStr = strings.Trim(optStr, "\"")
-	parts := strings.Fields(optStr)
-	for _, part := range parts {
-		lower := strings.ToLower(part)
-		if lower == "usebackq" {
+	// Custom split: keys are space-separated, but the value of `delims=`
+	// is everything from `=` to the next space or end (preserves a literal
+	// space delimiter as in `delims= `).
+	i := 0
+	for i < len(optStr) {
+		// Skip leading whitespace between keys
+		for i < len(optStr) && (optStr[i] == ' ' || optStr[i] == '\t') {
+			i++
+		}
+		if i >= len(optStr) {
+			break
+		}
+		// Read the key up to '=' or whitespace
+		keyStart := i
+		for i < len(optStr) && optStr[i] != '=' && optStr[i] != ' ' && optStr[i] != '\t' {
+			i++
+		}
+		key := strings.ToLower(optStr[keyStart:i])
+		if key == "usebackq" {
 			opts.usebackq = true
 			continue
 		}
-		if strings.HasPrefix(lower, "eol=") {
-			if len(part) > 4 {
-				opts.eol = part[4]
+		// If we stopped at '=', read the value
+		if i < len(optStr) && optStr[i] == '=' {
+			i++ // skip =
+			valStart := i
+			// For delims=, take everything up to the next non-delim option key
+			// pattern (i.e., space followed by a known keyword) or end.
+			if key == "delims" {
+				// Scan to end-of-string or until we see ` <key>=` pattern
+				for i < len(optStr) {
+					if optStr[i] == ' ' || optStr[i] == '\t' {
+						// Look ahead: next non-space starts a known keyword?
+						j := i + 1
+						for j < len(optStr) && (optStr[j] == ' ' || optStr[j] == '\t') {
+							j++
+						}
+						kStart := j
+						for j < len(optStr) && optStr[j] != '=' && optStr[j] != ' ' && optStr[j] != '\t' {
+							j++
+						}
+						kw := strings.ToLower(optStr[kStart:j])
+						if kw == "tokens" || kw == "eol" || kw == "usebackq" || kw == "skip" {
+							break
+						}
+					}
+					i++
+				}
+				opts.delims = optStr[valStart:i]
+				continue
 			}
-			continue
-		}
-		if strings.HasPrefix(lower, "tokens=") {
-			spec := part[7:]
-			opts.tokens = parseTokenSpec(spec)
-			continue
-		}
-		if strings.HasPrefix(lower, "delims=") {
-			opts.delims = part[7:]
-			continue
+			// Other values: read until next whitespace
+			for i < len(optStr) && optStr[i] != ' ' && optStr[i] != '\t' {
+				i++
+			}
+			val := optStr[valStart:i]
+			switch key {
+			case "tokens":
+				opts.tokens = parseTokenSpec(val)
+			case "eol":
+				if len(val) > 0 {
+					opts.eol = val[0]
+				}
+			}
 		}
 	}
 	return opts
@@ -926,6 +1131,99 @@ func splitByDelims(s, delims string) []string {
 	return strings.FieldsFunc(s, f)
 }
 
+// stripNulRedirect removes a trailing Windows null redirect (`2>nul`, `>nul`)
+// from a command string so it isn't passed to sh (which would create a file).
+func stripNulRedirect(cmd string) string {
+	for _, suffix := range []string{" 2>nul", " >nul", " 1>nul", " 2> nul", " > nul"} {
+		if idx := strings.Index(strings.ToLower(cmd), suffix); idx != -1 {
+			cmd = cmd[:idx] + cmd[idx+len(suffix):]
+		}
+	}
+	return strings.TrimSpace(cmd)
+}
+
+// runDirCommand handles Windows `dir` invocations used by BAT scripts (notably
+// `dir /A-D /S /B pattern` for recursive bare file listing). Returns the output
+// and true if the command was a dir command we could handle.
+func runDirCommand(cmdStr string) (string, bool) {
+	fields := strings.Fields(cmdStr)
+	if len(fields) == 0 || strings.ToLower(fields[0]) != "dir" {
+		return "", false
+	}
+
+	bare := false      // /B — bare format (just names/paths)
+	recursive := false // /S — recurse subdirectories
+	filesOnly := false // /A-D — exclude directories
+	var pattern string
+	for _, f := range fields[1:] {
+		upper := strings.ToUpper(f)
+		switch {
+		case upper == "/B":
+			bare = true
+		case upper == "/S":
+			recursive = true
+		case strings.HasPrefix(upper, "/A"):
+			if strings.Contains(upper, "-D") {
+				filesOnly = true
+			}
+		case strings.HasPrefix(f, "/"):
+			// ignore other flags
+		default:
+			pattern = strings.Trim(f, "\"")
+		}
+	}
+	if pattern == "" {
+		return "", false
+	}
+	pattern = strings.ReplaceAll(pattern, "\\", "/")
+
+	// Split pattern into directory and glob component.
+	dir := filepath.Dir(pattern)
+	glob := filepath.Base(pattern)
+	if dir == "" {
+		dir = "."
+	}
+
+	var matches []string
+	if recursive {
+		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return nil
+			}
+			if info.IsDir() {
+				if filesOnly {
+					return nil // skip emitting directories
+				}
+				return nil
+			}
+			if ok, _ := filepath.Match(glob, filepath.Base(path)); ok {
+				abs, _ := filepath.Abs(path)
+				matches = append(matches, abs)
+			}
+			return nil
+		})
+	} else {
+		entries, _ := filepath.Glob(filepath.Join(dir, glob))
+		for _, m := range entries {
+			info, err := os.Stat(m)
+			if err != nil {
+				continue
+			}
+			if filesOnly && info.IsDir() {
+				continue
+			}
+			abs, _ := filepath.Abs(m)
+			matches = append(matches, abs)
+		}
+	}
+
+	if !bare {
+		// We only support bare format meaningfully; fall back if not /B.
+		return strings.Join(matches, "\n"), true
+	}
+	return strings.Join(matches, "\n"), true
+}
+
 func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 	opts := parseForFOpts(s.Options)
 
@@ -943,17 +1241,38 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 			(strings.HasPrefix(source, "`") && strings.HasSuffix(source, "`")) {
 			// Command: execute and capture output
 			cmdStr := source[1 : len(source)-1]
-			out, err := exec.Command("sh", "-c", cmdStr).Output()
-			if err == nil {
-				lines = strings.Split(strings.TrimRight(string(out), "\n"), "\n")
+			// Strip a trailing `2>nul` / `>nul` (Windows null redirect) — sh
+			// would otherwise create a literal "nul" file.
+			cmdStr = stripNulRedirect(cmdStr)
+			// Convert Windows path separators (\) to / so sh doesn't treat
+			// them as escape sequences (e.g. `sort "%TEMP%\file"`).
+			cmdStr = strings.ReplaceAll(cmdStr, "\\", "/")
+			// Handle Windows `dir` internally; sh has no such command.
+			if out, ok := runDirCommand(cmdStr); ok {
+				lines = strings.Split(strings.TrimRight(out, "\r\n"), "\n")
+			} else {
+				out, err := exec.Command("sh", "-c", cmdStr).Output()
+				if err == nil {
+					lines = strings.Split(strings.TrimRight(string(out), "\r\n"), "\n")
+				}
+			}
+			// Strip trailing \r on each line (the captured output may carry
+			// CRLF line endings from files written by `echo`).
+			for i, ln := range lines {
+				lines[i] = strings.TrimRight(ln, "\r")
 			}
 		} else if strings.HasPrefix(source, "\"") && strings.HasSuffix(source, "\"") {
 			if opts.usebackq {
 				// usebackq + "..." = read from file
 				filename := source[1 : len(source)-1]
+				filename = strings.ReplaceAll(filename, "\\", "/")
 				data, err := os.ReadFile(filename)
 				if err == nil {
-					lines = strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+					lines = strings.Split(strings.TrimRight(string(data), "\r\n"), "\n")
+				// Strip trailing \r on each line (CRLF line endings)
+				for i, ln := range lines {
+					lines[i] = strings.TrimRight(ln, "\r")
+				}
 				}
 			} else {
 				// "string" = parse the string directly
@@ -962,9 +1281,14 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 			}
 		} else {
 			// Bare filename
+			source = strings.ReplaceAll(source, "\\", "/")
 			data, err := os.ReadFile(source)
 			if err == nil {
-				lines = strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+				lines = strings.Split(strings.TrimRight(string(data), "\r\n"), "\n")
+				// Strip trailing \r on each line (CRLF line endings)
+				for i, ln := range lines {
+					lines[i] = strings.TrimRight(ln, "\r")
+				}
 			}
 		}
 	}
@@ -973,6 +1297,10 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 	baseVar := strings.ToUpper(s.Variable)
 
 	for _, line := range lines {
+		// FOR /F skips blank lines entirely (matches cmd.exe).
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
 		// Skip EOL comment lines
 		if opts.eol != 0 && len(line) > 0 && line[0] == opts.eol {
 			continue
@@ -1034,12 +1362,19 @@ func (ex *Executor) execEndlocal() int {
 // --- EXIT ---
 
 func (ex *Executor) execExit(s *parser.ExitStatement) int {
+	code := s.Code
+	if len(s.CodeParts) > 0 {
+		val := strings.TrimSpace(ex.expandParts(s.CodeParts))
+		if n, err := strconv.Atoi(val); err == nil {
+			code = n
+		}
+	}
 	if s.SubOnly {
 		ex.exitPending = true
-		return s.Code
+		return code
 	}
-	os.Exit(s.Code)
-	return s.Code
+	os.Exit(code)
+	return code
 }
 
 // --- SimpleCommand ---
@@ -1164,6 +1499,38 @@ func countUnquotedParens(line string) int {
 	return depth
 }
 
+// joinCaretContinuations merges lines that end with an unescaped caret (^),
+// the BAT line-continuation marker. A trailing `^` (after stripping CR) means
+// the next physical line is part of the same logical line.
+func joinCaretContinuations(lines []string) []string {
+	var result []string
+	i := 0
+	for i < len(lines) {
+		line := strings.TrimRight(lines[i], "\r")
+		// Count trailing carets; an odd count means the last one is a
+		// continuation (an even count is escaped carets `^^`).
+		for endsWithContinuationCaret(line) && i+1 < len(lines) {
+			line = line[:len(line)-1] // drop the trailing ^
+			i++
+			next := strings.TrimRight(lines[i], "\r")
+			line += next
+		}
+		result = append(result, line)
+		i++
+	}
+	return result
+}
+
+// endsWithContinuationCaret reports whether the line ends with an odd number of
+// carets (so the final caret is a line-continuation, not an escaped `^^`).
+func endsWithContinuationCaret(line string) bool {
+	n := 0
+	for j := len(line) - 1; j >= 0 && line[j] == '^'; j-- {
+		n++
+	}
+	return n%2 == 1
+}
+
 func joinBlocks(lines []scriptLine) []scriptLine {
 	var result []scriptLine
 	depth := 0
@@ -1192,7 +1559,9 @@ func joinBlocks(lines []scriptLine) []scriptLine {
 			accum = line
 			depth += opens
 		} else {
-			accum += " & " + strings.TrimSpace(line)
+			// Use \x01 as a line-boundary marker; the parser treats it as a
+			// statement separator that does NOT get consumed into IF/FOR body.
+			accum += "\x01" + strings.TrimSpace(line)
 			depth += opens
 		}
 
@@ -1240,6 +1609,8 @@ func (ex *Executor) resolveBat(name string) (string, bool) {
 	// BAT uses ; as PATH separator, Unix uses : — support both
 	pathEnv = strings.ReplaceAll(pathEnv, ";", string(filepath.ListSeparator))
 	for _, dir := range filepath.SplitList(pathEnv) {
+		// Convert Windows-style backslashes to forward slashes for OS calls
+		dir = strings.ReplaceAll(dir, "\\", "/")
 		for _, c := range candidates {
 			full := filepath.Join(dir, c)
 			if _, err := os.Stat(full); err == nil {
@@ -1274,6 +1645,7 @@ func (ex *Executor) applyRedirects(redirects []parser.Redirect) func() {
 
 	savedOut := os.Stdout
 	savedErr := os.Stderr
+	savedIn := os.Stdin
 	var files []*os.File
 
 	for _, r := range redirects {
@@ -1301,12 +1673,19 @@ func (ex *Executor) applyRedirects(redirects []parser.Redirect) func() {
 			os.Stdout = os.Stderr
 		case "2>&1":
 			os.Stderr = os.Stdout
+		case "<":
+			f, err := os.Open(file)
+			if err == nil {
+				os.Stdin = f
+				files = append(files, f)
+			}
 		}
 	}
 
 	return func() {
 		os.Stdout = savedOut
 		os.Stderr = savedErr
+		os.Stdin = savedIn
 		for _, f := range files {
 			f.Close()
 		}

@@ -34,4 +34,10 @@ var Registry = map[string]Func{
 	"RENAME":   Ren,
 	"CERTUTIL": Certutil,
 	"CMD":      Cmd,
+	// CHCP sets the console code page on Windows; a no-op on Unix.
+	"CHCP": func(_ []string, _ *env.Env) int { return 0 },
+	// VER / TITLE / COLOR are cosmetic Windows console commands; no-op.
+	"VER":   func(_ []string, _ *env.Env) int { return 0 },
+	"TITLE": func(_ []string, _ *env.Env) int { return 0 },
+	"COLOR": func(_ []string, _ *env.Env) int { return 0 },
 }

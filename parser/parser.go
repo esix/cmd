@@ -22,12 +22,14 @@ func ParseLine(line string) ([]Statement, error) {
 // ParseLineWithOpts tokenizes with delayed expansion control, then parses.
 func ParseLineWithOpts(line string, delayedExpansion bool) ([]Statement, error) {
 	tokens := lexer.TokenizeWithOpts(line, delayedExpansion)
-	return Parse(tokens)
+	p := &parser{tokens: tokens, pos: 0, raw: line}
+	return p.parseStatements()
 }
 
 type parser struct {
 	tokens []lexer.Token
 	pos    int
+	raw    string // original line text (for tokens that need exact slicing)
 }
 
 func (p *parser) peek() lexer.Token {
@@ -62,6 +64,26 @@ func (p *parser) parseStatements() ([]Statement, error) {
 	return stmts, nil
 }
 
+// attachRedirects prepends leading redirects to a statement's redirect list.
+func attachRedirects(stmt Statement, leading []Redirect) {
+	if len(leading) == 0 {
+		return
+	}
+	switch s := stmt.(type) {
+	case *EchoStatement:
+		s.Redirects = append(leading, s.Redirects...)
+		// Verbatim text can't represent the redirect target cleanly, so fall
+		// back to the token-based args when a redirect is attached.
+		s.HasRaw = false
+	case *SimpleCommand:
+		s.Redirects = append(leading, s.Redirects...)
+	case *SetStatement:
+		s.Redirects = append(leading, s.Redirects...)
+	case *CallStatement:
+		s.Redirects = append(leading, s.Redirects...)
+	}
+}
+
 // parseChain handles: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2
 func (p *parser) parseChain() (Statement, error) {
 	left, err := p.parsePipe()
@@ -71,6 +93,35 @@ func (p *parser) parseChain() (Statement, error) {
 	for {
 		tok := p.peek()
 		if tok.Kind == lexer.AND || tok.Kind == lexer.OR || tok.Kind == lexer.AMPERSAND {
+			op := tok.Value
+			p.consume()
+			right, err := p.parsePipe()
+			if err != nil {
+				return nil, err
+			}
+			if right == nil {
+				break
+			}
+			left = &ChainStatement{Left: left, Op: op, Right: right}
+		} else {
+			break
+		}
+	}
+	return left, nil
+}
+
+// parseIfChain is like parseChain but stops at the block-line boundary marker
+// (\x01) so an IF body does not consume statements from later block lines.
+// Used for IF THEN/ELSE bodies that aren't wrapped in parens.
+func (p *parser) parseIfChain() (Statement, error) {
+	left, err := p.parsePipe()
+	if err != nil || left == nil {
+		return left, err
+	}
+	for {
+		tok := p.peek()
+		if tok.Kind == lexer.AND || tok.Kind == lexer.OR ||
+			(tok.Kind == lexer.AMPERSAND && tok.Value != "\x01") {
 			op := tok.Value
 			p.consume()
 			right, err := p.parsePipe()
@@ -118,6 +169,26 @@ func (p *parser) parseOne() (Statement, error) {
 		return nil, nil
 	}
 
+	// Leading redirections (e.g. `> file echo text`): collect them, parse the
+	// command that follows, and attach the redirects to it.
+	if tok.Kind == lexer.REDIRECTION {
+		var leading []Redirect
+		for p.peek().Kind == lexer.REDIRECTION {
+			op := p.consume().Value
+			file := ""
+			if p.peek().Kind == lexer.WORD {
+				file = p.consume().Value
+			}
+			leading = append(leading, Redirect{Op: op, File: file})
+		}
+		stmt, err := p.parseOne()
+		if err != nil {
+			return nil, err
+		}
+		attachRedirects(stmt, leading)
+		return stmt, nil
+	}
+
 	// Block: ( ... )
 	if tok.Kind == lexer.LPAREN {
 		return p.parseBlock()
@@ -132,6 +203,23 @@ func (p *parser) parseOne() (Statement, error) {
 	if strings.HasPrefix(cmdName, "ECHO.") {
 		p.consume()
 		return &EchoStatement{Newline: true}, nil
+	}
+
+	// ECHO( safe-echo idiom: `echo(text` is equivalent to `echo text`,
+	// and `echo(` alone prints a blank line.
+	if strings.HasPrefix(cmdName, "ECHO(") {
+		tok := p.consume()
+		rest := tok.Value[len("echo("):] // text glued onto the echo( token
+		var groups [][]WordPart
+		if rest != "" {
+			groups = append(groups, parseWordParts(rest))
+		}
+		// Collect any further space-separated args on the line.
+		groups = append(groups, p.collectWordGroups()...)
+		if len(groups) == 0 {
+			return &EchoStatement{Newline: true}, nil
+		}
+		return &EchoStatement{Args: groups}, nil
 	}
 
 	switch cmdName {
@@ -172,7 +260,10 @@ func (p *parser) parseBlock() (Statement, error) {
 			p.consume()
 			continue
 		}
-		stmt, err := p.parseChain()
+		// Inside a block, each line is a separate statement. The block-line
+		// marker (\x01) and "&" both act as statement separators here, so
+		// we should NOT chain through "&" within the block.
+		stmt, err := p.parseIfChain()
 		if err != nil {
 			return nil, err
 		}
@@ -189,7 +280,7 @@ func (p *parser) parseBlock() (Statement, error) {
 // --- ECHO ---
 
 func (p *parser) parseEcho() (Statement, error) {
-	p.consume() // consume ECHO
+	echoTok := p.consume() // consume ECHO
 
 	if p.atEnd() {
 		return &EchoStatement{}, nil
@@ -211,6 +302,13 @@ func (p *parser) parseEcho() (Statement, error) {
 	}
 
 	args := p.collectWordGroups()
+	// The token right after the args marks where the echo body ends
+	// (RPAREN, &, |, redirect, block-marker, or EOF). Use its position to
+	// bound the verbatim text so we don't capture a block's closing ")".
+	argsEndPos := len(p.raw)
+	if bt := p.peek(); bt.Kind != lexer.EOF {
+		argsEndPos = bt.Pos
+	}
 	// Collect any trailing redirections (e.g. ECHO error 1>&2)
 	var redirects []Redirect
 	for p.peek().Kind == lexer.REDIRECTION {
@@ -221,7 +319,32 @@ func (p *parser) parseEcho() (Statement, error) {
 		}
 		redirects = append(redirects, Redirect{Op: op, File: file})
 	}
-	return &EchoStatement{Args: args, Redirects: redirects}, nil
+
+	// Capture verbatim text after "echo " so internal/leading spacing is
+	// preserved (cmd.exe: exactly one space after ECHO is the separator, the
+	// rest is literal). Only when no redirects are present.
+	stmt := &EchoStatement{Args: args, Redirects: redirects}
+	if len(redirects) == 0 && p.raw != "" {
+		contentStart := echoTok.Pos + len(echoTok.Value)
+		// Skip exactly one separator space/tab.
+		if contentStart < len(p.raw) && (p.raw[contentStart] == ' ' || p.raw[contentStart] == '\t') {
+			contentStart++
+		}
+		endPos := argsEndPos
+		if endPos > len(p.raw) {
+			endPos = len(p.raw)
+		}
+		if contentStart <= endPos {
+			raw := strings.TrimRight(p.raw[contentStart:endPos], " \t")
+			// Carets are escape characters the token path already resolved;
+			// only use verbatim text when none are present.
+			if !strings.ContainsRune(raw, '^') {
+				stmt.RawText = raw
+				stmt.HasRaw = true
+			}
+		}
+	}
+	return stmt, nil
 }
 
 // --- SET ---
@@ -250,11 +373,58 @@ func (p *parser) parseSet() (Statement, error) {
 		return &SetStatement{Arithmetic: arithmetic, Prompt: prompt}, nil
 	}
 
-	raw := p.consume().Value
+	tok := p.consume()
+	raw := tok.Value
+	tokPos := tok.Pos
+	hadQuotes := strings.HasPrefix(raw, "\"") && strings.HasSuffix(raw, "\"") && len(raw) >= 2
 	// Strip surrounding quotes for SET "name=value" and SET /A "expr"
 	raw = stripQuotes(raw)
 
 	eqIdx := strings.IndexByte(raw, '=')
+
+	// For unquoted SET name=value: look up the value in the raw line so we
+	// preserve trailing whitespace that the lexer would otherwise drop.
+	// e.g. `set X= ` → value = " " (single space) not ""
+	if !hadQuotes && eqIdx >= 0 && p.raw != "" && tokPos+len(raw) <= len(p.raw) {
+		// Position of `=` in original line
+		eqPosInLine := tokPos + eqIdx
+		// Find end of value: stop at unquoted &, |, > or end of line.
+		// \x01 is the block-line boundary marker (acts like &).
+		endPos := len(p.raw)
+		hitSep := false
+		inQuote := false
+		for i := eqPosInLine + 1; i < len(p.raw); i++ {
+			ch := p.raw[i]
+			if ch == '"' {
+				inQuote = !inQuote
+				continue
+			}
+			if !inQuote && (ch == '&' || ch == '|' || ch == '>' || ch == '<' || ch == '\x01') {
+				endPos = i
+				hitSep = true
+				break
+			}
+		}
+		valueStr := p.raw[eqPosInLine+1 : endPos]
+		// When value is followed by a separator (&,|,>,<) we trim the
+		// trailing whitespace that the user used for visual spacing.
+		// Trailing spaces at end-of-line ARE preserved (e.g. `set X= `).
+		if hitSep {
+			valueStr = strings.TrimRight(valueStr, " \t")
+		}
+		// Reconstruct raw to include the full value
+		raw = p.raw[tokPos:eqPosInLine+1] + valueStr
+		eqIdx = strings.IndexByte(raw, '=')
+		// Skip remaining tokens until next separator since we consumed the value
+		for !p.atEnd() {
+			t := p.peek()
+			if t.Kind == lexer.AMPERSAND || t.Kind == lexer.AND || t.Kind == lexer.OR ||
+				t.Kind == lexer.PIPE || t.Kind == lexer.REDIRECTION || t.Kind == lexer.RPAREN {
+				break
+			}
+			p.consume()
+		}
+	}
 
 	// For SET /A with spaces: "set /a ii = 2 * i"
 	// The = may be a separate token. Collect all tokens as the expression.
@@ -337,15 +507,33 @@ func (p *parser) parseSet() (Statement, error) {
 func (p *parser) parseIf() (Statement, error) {
 	p.consume() // consume IF
 
+	// Optional flags: /I (case-insensitive), and order-independent NOT
+	caseInsensitive := false
 	not := false
-	if p.peek().Kind == lexer.WORD && strings.ToUpper(p.peek().Value) == "NOT" {
-		not = true
-		p.consume()
+	for p.peek().Kind == lexer.WORD {
+		upper := strings.ToUpper(p.peek().Value)
+		if upper == "/I" {
+			caseInsensitive = true
+			p.consume()
+			continue
+		}
+		if upper == "NOT" {
+			not = true
+			p.consume()
+			continue
+		}
+		break
 	}
 
 	cond, err := p.parseCondition()
 	if err != nil {
 		return nil, err
+	}
+	// Mark string-compare conditions as case-insensitive when /I present
+	if caseInsensitive {
+		if sc, ok := cond.(*StringCompare); ok {
+			sc.CaseInsensitive = true
+		}
 	}
 
 	then, elseStmts, err := p.parseIfBody()
@@ -369,7 +557,7 @@ func (p *parser) parseCondition() (Condition, error) {
 
 		if upper == "EXIST" {
 			p.consume()
-			path := p.collectWordParts()
+			path := p.collectOneWordParts()
 			return &ExistCondition{Path: path}, nil
 		}
 
@@ -442,8 +630,10 @@ func (p *parser) parseIfBody() (then []Statement, elseStmts []Statement, err err
 		}
 		then = block.(*BlockStatement).Stmts
 	} else {
-		// In CMD, the THEN body extends to end of line (including & chains)
-		thenStmt, err := p.parseChain()
+		// In CMD, the THEN body extends to end of line (including & chains).
+		// We stop at the line-boundary marker (\x01) injected by joinBlocks
+		// so that IF body does not absorb subsequent block-level statements.
+		thenStmt, err := p.parseIfChain()
 		if err != nil {
 			return nil, nil, err
 		}
@@ -462,7 +652,7 @@ func (p *parser) parseIfBody() (then []Statement, elseStmts []Statement, err err
 			}
 			elseStmts = block.(*BlockStatement).Stmts
 		} else {
-			elseStmt, err := p.parseChain()
+			elseStmt, err := p.parseIfChain()
 			if err != nil {
 				return nil, nil, err
 			}
@@ -507,8 +697,21 @@ func (p *parser) parseGoto() (Statement, error) {
 
 func (p *parser) parseCall() (Statement, error) {
 	p.consume()
-	args := p.collectWordParts()
-	return &CallStatement{Args: args}, nil
+	// Each whitespace-separated token is one argument. collectWordGroups
+	// keeps the parts of a single token (e.g. "!_path!") together so a quoted
+	// delayed-expansion argument isn't split into multiple positional params.
+	args := p.collectWordGroups()
+	// Collect trailing redirections (e.g. CALL foo > out.txt 2>&1).
+	var redirects []Redirect
+	for p.peek().Kind == lexer.REDIRECTION {
+		op := p.consume().Value
+		file := ""
+		if p.peek().Kind == lexer.WORD {
+			file = p.consume().Value
+		}
+		redirects = append(redirects, Redirect{Op: op, File: file})
+	}
+	return &CallStatement{Args: args, Redirects: redirects}, nil
 }
 
 // --- FOR ---
@@ -518,6 +721,7 @@ func (p *parser) parseFor() (Statement, error) {
 
 	kind := ForInList
 	options := ""
+	rootPath := ""
 
 	if p.peek().Kind == lexer.WORD {
 		flag := strings.ToUpper(p.peek().Value)
@@ -529,6 +733,16 @@ func (p *parser) parseFor() (Statement, error) {
 			p.consume()
 			if p.peek().Kind == lexer.WORD {
 				options = p.consume().Value
+			}
+		} else if flag == "/D" {
+			kind = ForDirs
+			p.consume()
+		} else if flag == "/R" {
+			kind = ForRecursive
+			p.consume()
+			// Optional root path before the variable
+			if p.peek().Kind == lexer.WORD && !strings.HasPrefix(p.peek().Value, "%") {
+				rootPath = p.consume().Value
 			}
 		}
 	}
@@ -590,6 +804,7 @@ func (p *parser) parseFor() (Statement, error) {
 		Kind:     kind,
 		InList:   items,
 		Options:  options,
+		RootPath: rootPath,
 		Body:     bodyStmts,
 	}, nil
 }
@@ -606,12 +821,19 @@ func (p *parser) parseExit() (Statement, error) {
 		p.consume()
 	}
 
+	// Code may be a literal number or a variable reference (e.g. !ERRORLEVEL!).
 	if p.peek().Kind == lexer.WORD {
 		n, err := strconv.Atoi(p.peek().Value)
 		if err == nil {
 			code = n
 			p.consume()
 		}
+	} else if p.peek().Kind == lexer.BANG_VAR || p.peek().Kind == lexer.PERCENT_VAR {
+		tok := p.consume()
+		return &ExitStatement{
+			CodeParts: tokenToParts(tok),
+			SubOnly:   subOnly,
+		}, nil
 	}
 
 	return &ExitStatement{Code: code, SubOnly: subOnly}, nil
@@ -648,7 +870,9 @@ func (p *parser) parseSimpleCommand() (Statement, error) {
 			name := strings.Trim(tok.Value, "!")
 			args = append(args, &DelayedVarPart{Name: name})
 		default:
-			args = append(args, parseWordParts(tok.Value)...)
+			// Each WORD token is one argument. Treat as a single LiteralPart;
+			// ExpandWord will run %% and !! expansion on the text at runtime.
+			args = append(args, &LiteralPart{Text: tok.Value})
 		}
 	}
 
@@ -670,7 +894,9 @@ func (p *parser) collectWordGroups() [][]WordPart {
 	var groups [][]WordPart
 	for !p.atEnd() {
 		tok := p.peek()
-		if tok.Kind == lexer.PIPE || tok.Kind == lexer.REDIRECTION {
+		if tok.Kind == lexer.PIPE || tok.Kind == lexer.REDIRECTION ||
+			tok.Kind == lexer.AMPERSAND || tok.Kind == lexer.AND ||
+			tok.Kind == lexer.OR || tok.Kind == lexer.RPAREN {
 			break
 		}
 		p.consume()
@@ -753,7 +979,8 @@ func tokenToParts(tok lexer.Token) []WordPart {
 	}
 }
 
-// parseWordParts splits a raw string into LiteralParts, VarParts, and TildeVarParts.
+// parseWordParts splits a raw string into LiteralParts, VarParts, TildeVarParts,
+// and DelayedVarParts (for !VAR! references).
 func parseWordParts(s string) []WordPart {
 	if s == "" {
 		return nil
@@ -761,14 +988,66 @@ func parseWordParts(s string) []WordPart {
 	var parts []WordPart
 	i := 0
 	for i < len(s) {
+		// Find next % or ! (whichever comes first)
 		pct := strings.IndexByte(s[i:], '%')
-		if pct == -1 {
+		bang := strings.IndexByte(s[i:], '!')
+		var nextIdx int
+		var nextCh byte
+		if pct == -1 && bang == -1 {
 			parts = append(parts, &LiteralPart{Text: s[i:]})
 			break
 		}
-		pct += i
-		if pct > i {
-			parts = append(parts, &LiteralPart{Text: s[i:pct]})
+		if pct == -1 {
+			nextIdx = bang + i
+			nextCh = '!'
+		} else if bang == -1 {
+			nextIdx = pct + i
+			nextCh = '%'
+		} else if pct < bang {
+			nextIdx = pct + i
+			nextCh = '%'
+		} else {
+			nextIdx = bang + i
+			nextCh = '!'
+		}
+
+		if nextIdx > i {
+			parts = append(parts, &LiteralPart{Text: s[i:nextIdx]})
+		}
+
+		// Handle !VAR! delayed expansion
+		if nextCh == '!' {
+			closeIdx := strings.IndexByte(s[nextIdx+1:], '!')
+			if closeIdx == -1 {
+				parts = append(parts, &LiteralPart{Text: "!"})
+				i = nextIdx + 1
+				continue
+			}
+			closeIdx += nextIdx + 1
+			name := s[nextIdx+1 : closeIdx]
+			if name == "" {
+				parts = append(parts, &LiteralPart{Text: "!"})
+				i = closeIdx + 1
+				continue
+			}
+			parts = append(parts, &DelayedVarPart{Name: name})
+			i = closeIdx + 1
+			continue
+		}
+
+		pct = nextIdx
+		// %%X (FOR variable: single letter, not followed by alnum)
+		if pct+2 < len(s) && s[pct+1] == '%' {
+			ch := s[pct+2]
+			isLetter := (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+			nextIsAlnum := pct+3 < len(s) && ((s[pct+3] >= 'a' && s[pct+3] <= 'z') ||
+				(s[pct+3] >= 'A' && s[pct+3] <= 'Z') ||
+				(s[pct+3] >= '0' && s[pct+3] <= '9') || s[pct+3] == '_')
+			if isLetter && !nextIsAlnum {
+				parts = append(parts, &VarPart{Name: string(ch), Positional: -1})
+				i = pct + 3
+				continue
+			}
 		}
 
 		// %~[modifiers]N — tilde parameter reference

@@ -58,6 +58,13 @@ func (l *lexer) tokenize() []Token {
 			addToken(Token{Kind: AMPERSAND, Value: "&", Pos: l.pos})
 			l.pos++
 
+		case ch == '\x01':
+			// Block-line boundary marker injected by joinBlocks.
+			// Treat like AMPERSAND but with a marker so the parser knows
+			// not to consume it into an IF/FOR body.
+			addToken(Token{Kind: AMPERSAND, Value: "\x01", Pos: l.pos})
+			l.pos++
+
 		case ch == '|':
 			addToken(Token{Kind: PIPE, Value: "|", Pos: l.pos})
 			l.pos++
@@ -237,7 +244,7 @@ func (l *lexer) readWord() Token {
 		if ch == '(' && sb.Len() == 0 {
 			break
 		}
-		if ch == '&' {
+		if ch == '&' || ch == '\x01' {
 			break
 		}
 		if ch == '|' {

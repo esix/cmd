@@ -136,33 +136,39 @@ func tildeExpand(digit int, mods string, positional []string) string {
 	path := stripQuotes(val)
 	result := ""
 
+	// Resolve to absolute path for d/p modifiers (matches Windows %~dp0 behavior)
+	absPath := path
+	if abs, err := filepath.Abs(path); err == nil {
+		absPath = abs
+	}
+
 	if strings.Contains(mods, "f") {
-		abs, err := filepath.Abs(path)
-		if err == nil {
-			return abs
-		}
-		return path
+		return absPath
 	}
 
 	if strings.Contains(mods, "d") {
-		if filepath.IsAbs(path) {
+		if filepath.IsAbs(absPath) {
 			result += "/"
 		}
 	}
 	if strings.Contains(mods, "p") {
-		dir := filepath.Dir(path)
+		dir := filepath.Dir(absPath)
+		// Avoid duplicating leading slash from "d"
+		if strings.Contains(mods, "d") && strings.HasPrefix(dir, "/") {
+			dir = strings.TrimPrefix(dir, "/")
+		}
 		if !strings.HasSuffix(dir, "/") {
 			dir += "/"
 		}
 		result += dir
 	}
 	if strings.Contains(mods, "n") {
-		base := filepath.Base(path)
+		base := filepath.Base(absPath)
 		ext := filepath.Ext(base)
 		result += strings.TrimSuffix(base, ext)
 	}
 	if strings.Contains(mods, "x") {
-		result += filepath.Ext(path)
+		result += filepath.Ext(absPath)
 	}
 
 	if result == "" {

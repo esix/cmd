@@ -63,9 +63,10 @@ func (*IfStatement) statementNode() {}
 type Condition interface{ conditionNode() }
 
 type StringCompare struct {
-	Left  []WordPart
-	Op    string // "==" only in BAT
-	Right []WordPart
+	Left            []WordPart
+	Op              string // "==" only in BAT
+	Right           []WordPart
+	CaseInsensitive bool // true for `if /I "X"=="y"`
 }
 
 func (*StringCompare) conditionNode() {}
@@ -103,7 +104,8 @@ func (*GotoStatement) statementNode() {}
 // --- CALL ---
 
 type CallStatement struct {
-	Args []WordPart // Args[0] is the script/label
+	Args      [][]WordPart // each element is one argument (group of parts); Args[0] is the script/label
+	Redirects []Redirect
 }
 
 func (*CallStatement) statementNode() {}
@@ -126,8 +128,10 @@ func (*SetStatement) statementNode() {}
 type EchoStatement struct {
 	Args      [][]WordPart
 	Redirects []Redirect
-	TurnOn    *bool // nil = not a toggle; true = ECHO ON, false = ECHO OFF
-	Newline   bool  // ECHO. prints a blank line
+	TurnOn    *bool  // nil = not a toggle; true = ECHO ON, false = ECHO OFF
+	Newline   bool   // ECHO. prints a blank line
+	RawText   string // verbatim text after "echo " (preserves spacing); "" if unused
+	HasRaw    bool   // true when RawText should be used instead of Args
 }
 
 func (*EchoStatement) statementNode() {}
@@ -141,6 +145,8 @@ const (
 	ForInFiles                // FOR %%I IN (*.txt) DO
 	ForRange                  // FOR /L %%I IN (start,step,end) DO
 	ForTokens                 // FOR /F "tokens=..." %%I IN (...) DO
+	ForDirs                   // FOR /D %%I IN (pattern) DO
+	ForRecursive              // FOR /R [path] %%I IN (pattern) DO
 )
 
 type ForStatement struct {
@@ -148,6 +154,7 @@ type ForStatement struct {
 	Kind     ForKind
 	InList   []string
 	Options  string
+	RootPath string // for /R: the root directory to walk (empty = current dir)
 	Body     []Statement
 }
 
@@ -156,8 +163,9 @@ func (*ForStatement) statementNode() {}
 // --- EXIT ---
 
 type ExitStatement struct {
-	Code    int
-	SubOnly bool // EXIT /B
+	Code      int
+	CodeParts []WordPart // dynamic code, e.g. EXIT /B !ERRORLEVEL!
+	SubOnly   bool       // EXIT /B
 }
 
 func (*ExitStatement) statementNode() {}

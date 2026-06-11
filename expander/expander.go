@@ -54,6 +54,10 @@ func expandTilde(pt *parser.TildeVarPart, positional []string) string {
 	if pt.Positional < len(positional) {
 		val = positional[pt.Positional]
 	}
+	if dbg := false; dbg {
+		// Hidden debug; enable by setting dbg true
+		_ = val
+	}
 
 	// No modifiers: just strip surrounding quotes
 	if pt.Modifiers == "" {
@@ -73,17 +77,28 @@ func expandTilde(pt *parser.TildeVarPart, positional []string) string {
 	}
 
 	path := stripQuotes(val)
+	// Resolve to absolute path so d/p modifiers return useful paths,
+	// matching Windows cmd.exe behavior where %~dp0 always gives full dir.
+	absPath := path
+	if abs, err := filepath.Abs(path); err == nil {
+		absPath = abs
+	}
 
-	// d = drive (on Unix, always empty or /)
+	// d = drive (on Unix, always / for absolute paths)
 	if strings.Contains(mods, "d") {
-		if filepath.IsAbs(path) {
+		if filepath.IsAbs(absPath) {
 			result += "/"
 		}
 	}
 
-	// p = path (directory part)
+	// p = path (directory part of the absolute path)
 	if strings.Contains(mods, "p") {
-		result += filepath.Dir(path)
+		dir := filepath.Dir(absPath)
+		// If d was already added "/", don't double the leading slash
+		if strings.Contains(mods, "d") && strings.HasPrefix(dir, "/") {
+			dir = strings.TrimPrefix(dir, "/")
+		}
+		result += dir
 		if !strings.HasSuffix(result, "/") {
 			result += "/"
 		}
@@ -153,7 +168,23 @@ func expandSubstring(pt *parser.SubstringVarPart, e *env.Env) string {
 
 // expandDelayedRef resolves a delayed variable reference which may contain
 // substring (:~N,M) or replacement (:old=new) modifiers.
+// The name may contain %VAR%, %%i, or !VAR! references that must be expanded
+// first (e.g. !_s:~%%i,1! inside a FOR body needs %%i replaced with the FOR var).
 func expandDelayedRef(name string, e *env.Env) string {
+	return resolveDelayedRef(name, e)
+}
+
+// resolveDelayedRef resolves a single delayed-expansion reference's inner name
+// (the text between the !...!) to its value, applying cmd.exe semantics:
+//   - %%i / %VAR% nested refs are resolved first (FOR-body case)
+//   - VAR:~N,M  → substring
+//   - VAR:old=new → string replacement
+//   - VAR=       → cmd.exe quirk: value with one leading '=' stripped iff it
+//                  starts with '=', else empty. gw-batsic's char→hex table
+//                  relies on this to encode the '=' character.
+//   - VAR        → plain lookup
+func resolveDelayedRef(name string, e *env.Env) string {
+	name = expandNestedPercents(name, e)
 	if colonIdx := strings.Index(name, ":~"); colonIdx != -1 {
 		varName := name[:colonIdx]
 		spec := name[colonIdx+2:]
@@ -168,7 +199,78 @@ func expandDelayedRef(name string, e *env.Env) string {
 			return strings.ReplaceAll(e.Get(varName), old, newStr)
 		}
 	}
+	// cmd.exe quirk: `!VAR=!` (trailing '=', no colon) yields VAR's value with
+	// one leading '=' removed if it starts with '=', otherwise empty.
+	if len(name) > 1 && name[len(name)-1] == '=' && !strings.Contains(name, ":") {
+		val := e.Get(name[:len(name)-1])
+		if strings.HasPrefix(val, "=") {
+			return val[1:]
+		}
+		return ""
+	}
 	return e.Get(name)
+}
+
+// ExpandName resolves a variable name that may itself contain %%X (FOR var),
+// %VAR%, or !VAR! references — e.g. the target of `set "%%a=..."` in a FOR body.
+func ExpandName(s string, e *env.Env) string {
+	if e.DelayedExpansion {
+		s = expandBangs(s, e)
+	}
+	return expandNestedPercents(s, e)
+}
+
+// ExpandForVars resolves %%X (FOR variables) and %VAR% references in a string.
+// Used for FOR /IN list items like `for %%p in (%%j)` where the inner list
+// references the outer loop's variable.
+func ExpandForVars(s string, e *env.Env) string {
+	return expandNestedPercents(s, e)
+}
+
+// expandNestedPercents resolves %% (FOR var) and %VAR% inside a delayed-ref name.
+func expandNestedPercents(s string, e *env.Env) string {
+	var sb strings.Builder
+	i := 0
+	for i < len(s) {
+		if s[i] != '%' {
+			sb.WriteByte(s[i])
+			i++
+			continue
+		}
+		// %% followed by single letter — FOR variable: look up that letter as env var
+		if i+1 < len(s) && s[i+1] == '%' {
+			if i+2 < len(s) {
+				ch := s[i+2]
+				if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') {
+					sb.WriteString(e.Get(string(ch)))
+					i += 3
+					continue
+				}
+			}
+			// Plain %% → emit as is
+			sb.WriteByte('%')
+			sb.WriteByte('%')
+			i += 2
+			continue
+		}
+		// %VAR% — find closing %
+		closeIdx := strings.IndexByte(s[i+1:], '%')
+		if closeIdx == -1 {
+			sb.WriteByte('%')
+			i++
+			continue
+		}
+		closeIdx += i + 1
+		varName := s[i+1 : closeIdx]
+		if varName == "" {
+			sb.WriteByte('%')
+			i = closeIdx + 1
+			continue
+		}
+		sb.WriteString(e.Get(varName))
+		i = closeIdx + 1
+	}
+	return sb.String()
 }
 
 // ExpandBangs expands !VAR! patterns in a string (delayed expansion).
@@ -198,32 +300,7 @@ func expandBangs(s string, e *env.Env) string {
 			i += 2
 			continue
 		}
-
-		// !VAR:~N,M! — substring
-		if colonIdx := strings.Index(name, ":~"); colonIdx != -1 {
-			varName := name[:colonIdx]
-			spec := name[colonIdx+2:]
-			val := e.Get(varName)
-			sb.WriteString(substringExpand(val, spec))
-			i += j + 2
-			continue
-		}
-
-		// !VAR:old=new! — string replacement
-		if colonIdx := strings.IndexByte(name, ':'); colonIdx != -1 {
-			eqIdx := strings.IndexByte(name[colonIdx+1:], '=')
-			if eqIdx != -1 {
-				varName := name[:colonIdx]
-				old := name[colonIdx+1 : colonIdx+1+eqIdx]
-				newStr := name[colonIdx+1+eqIdx+1:]
-				val := e.Get(varName)
-				sb.WriteString(strings.ReplaceAll(val, old, newStr))
-				i += j + 2
-				continue
-			}
-		}
-
-		sb.WriteString(e.Get(name))
+		sb.WriteString(resolveDelayedRef(name, e))
 		i += j + 2
 	}
 	return sb.String()
