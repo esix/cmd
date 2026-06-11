@@ -39,11 +39,24 @@ type Executor struct {
 	pc         int                // current line or statement index
 	gotoPending bool // true when GOTO was executed in a nested context
 	exitPending bool // true when EXIT /B was executed in a nested context
+	abortPending bool // true when the current batch file must terminate
+	                  // (missing CALL/GOTO label, malformed IF — cmd.exe aborts the script)
+	activeForVars []string // FOR variables currently in scope (innermost last)
 }
 
-// shouldStop returns true if GOTO or EXIT /B is pending.
+// shouldStop returns true if GOTO, EXIT /B, or a script abort is pending.
 func (ex *Executor) shouldStop() bool {
-	return ex.gotoPending || ex.exitPending
+	return ex.gotoPending || ex.exitPending || ex.abortPending
+}
+
+// isActiveForVar reports whether name is a FOR variable of an enclosing loop.
+func (ex *Executor) isActiveForVar(name string) bool {
+	for _, v := range ex.activeForVars {
+		if strings.EqualFold(v, name) {
+			return true
+		}
+	}
+	return false
 }
 
 // updatesErrorlevel reports whether a statement should update %ERRORLEVEL%
@@ -66,6 +79,9 @@ func New(e *env.Env) *Executor {
 
 // RunLine parses and runs a single line interactively.
 func (ex *Executor) RunLine(line string) int {
+	// A prior interactive command may have left an abort pending (e.g. a
+	// missing GOTO label at the prompt); the REPL itself never terminates.
+	ex.abortPending = false
 	// Strip leading @ (echo suppression)
 	echoLine := true
 	if strings.HasPrefix(line, "@") {
@@ -107,6 +123,15 @@ var fileCache = map[string]*scriptFile{}
 func (ex *Executor) RunFile(path string, args []string) int {
 	// Convert Windows backslash paths to Unix
 	path = strings.ReplaceAll(path, "\\", "/")
+	// Strip a drive-letter prefix (C:/foo → /foo) so Windows-style absolute
+	// paths in scripts resolve on Unix.
+	if len(path) >= 2 && path[1] == ':' &&
+		((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+		path = path[2:]
+		if path == "" {
+			path = "/"
+		}
+	}
 	// Resolve to absolute path for cache key
 	absPath, _ := filepath.Abs(path)
 
@@ -203,8 +228,6 @@ func (ex *Executor) runLines(slines []scriptLine, labelIdx map[string]int, path 
 			continue // labels are no-ops during execution
 		}
 
-		{
-			}
 		// Parse with current delayed expansion state
 		expanded := expander.ExpandPercent(sl.raw, ex.env, ex.positional)
 		stmts, err := parser.ParseLineWithOpts(expanded, ex.env.DelayedExpansion)
@@ -216,6 +239,16 @@ func (ex *Executor) runLines(slines []scriptLine, labelIdx map[string]int, path 
 			code = ex.execute(stmt)
 			if updatesErrorlevel(stmt) {
 				ex.env.ExitCode = code
+			}
+			if ex.abortPending {
+				// cmd.exe terminates the current batch file on a missing
+				// CALL/GOTO label or a malformed IF; control returns to the
+				// caller with errorlevel 1.
+				ex.abortPending = false
+				ex.pc = len(ex.lines)
+				code = 1
+				ex.env.ExitCode = 1
+				break
 			}
 			if ex.gotoPending {
 				ex.gotoPending = false
@@ -329,103 +362,70 @@ func (ex *Executor) execPipe(s *parser.PipeStatement) int {
 		return ex.execute(s.Commands[0])
 	}
 
-	// Build pipe chain: create all intermediate pipes
-	n := len(s.Commands)
-	pipes := make([]io.ReadCloser, n-1)
-	writers := make([]io.WriteCloser, n-1)
-	for i := 0; i < n-1; i++ {
-		r, w, err := os.Pipe()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Pipe error: %v\n", err)
-			return 1
-		}
-		pipes[i] = r
-		writers[i] = w
-	}
-
-	// Run each stage in a goroutine
-	type result struct {
-		index int
-		code  int
-	}
-	done := make(chan result, n)
-
+	// Run stages sequentially, buffering each stage's output and feeding it
+	// to the next stage's stdin. Every stage goes through the normal execute
+	// path on a CHILD executor, so builtins (TYPE, FINDSTR, ECHO, SET, ...)
+	// work inside pipelines and flow control (GOTO/EXIT/abort) never leaks
+	// out — cmd.exe runs pipe segments in child interpreters.
+	var input []byte
+	code := 0
 	for i, stmt := range s.Commands {
-		var stdin io.Reader = os.Stdin
-		var stdout io.Writer = os.Stdout
-		if i > 0 {
-			stdin = pipes[i-1]
-		}
-		if i < n-1 {
-			stdout = writers[i]
-		}
-
-		go func(idx int, st parser.Statement, in io.Reader, out io.Writer) {
-			code := ex.runPipeStage(st, in, out)
-			// Close our write end so the next stage sees EOF
-			if wc, ok := out.(io.WriteCloser); ok && idx < n-1 {
-				wc.Close()
-			}
-			done <- result{idx, code}
-		}(i, stmt, stdin, stdout)
+		last := i == len(s.Commands)-1
+		code, input = ex.runPipeStage(stmt, input, last)
 	}
-
-	// Collect results
-	codes := make([]int, n)
-	for range s.Commands {
-		r := <-done
-		codes[r.index] = r.code
-	}
-
-	for _, r := range pipes {
-		r.Close()
-	}
-
-	return codes[n-1] // exit code of last command
+	return code
 }
 
-// runPipeStage runs a single command in a pipeline with redirected I/O.
-func (ex *Executor) runPipeStage(stmt parser.Statement, stdin io.Reader, stdout io.Writer) int {
-	// External command (SimpleCommand)
-	if simple, ok := stmt.(*parser.SimpleCommand); ok {
-		args := make([]string, 0, len(simple.Args))
-		for _, part := range simple.Args {
-			args = append(args, ex.expandParts([]parser.WordPart{part}))
+// runPipeStage executes one pipeline segment. stdin is fed from the previous
+// segment's buffered output; a non-final segment's stdout is captured and
+// returned, the final segment writes to the real stdout.
+func (ex *Executor) runPipeStage(stmt parser.Statement, input []byte, last bool) (int, []byte) {
+	savedIn, savedOut := os.Stdin, os.Stdout
+
+	// Feed the previous stage's output as this stage's stdin.
+	inR, inW, err := os.Pipe()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Pipe error: %v\n", err)
+		return 1, nil
+	}
+	go func() {
+		inW.Write(input) //nolint:errcheck — reader may stop early
+		inW.Close()
+	}()
+	os.Stdin = inR
+
+	var outR, outW *os.File
+	var captured []byte
+	done := make(chan struct{})
+	if last {
+		close(done)
+	} else {
+		outR, outW, err = os.Pipe()
+		if err != nil {
+			os.Stdin = savedIn
+			inR.Close()
+			fmt.Fprintf(os.Stderr, "Pipe error: %v\n", err)
+			return 1, nil
 		}
-		if len(args) == 0 {
-			return 0
-		}
-		cmdName := strings.ToUpper(args[0])
-		// ECHO builtin — use system echo in pipe context
-		if cmdName == "ECHO" {
-			fmt.Fprintln(stdout, strings.Join(args[1:], " "))
-			return 0
-		}
-		cmd := exec.Command(args[0], args[1:]...)
-		cmd.Stdin = stdin
-		cmd.Stdout = stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				return exitErr.ExitCode()
-			}
-			return 1
-		}
-		return 0
+		os.Stdout = outW
+		go func() {
+			captured, _ = io.ReadAll(outR)
+			close(done)
+		}()
 	}
 
-	// Builtin statements (ECHO, TYPE, etc.) — redirect stdout
-	if echo, ok := stmt.(*parser.EchoStatement); ok {
-		words := make([]string, 0, len(echo.Args))
-		for _, group := range echo.Args {
-			words = append(words, ex.expandParts(group))
-		}
-		fmt.Fprintln(stdout, strings.Join(words, " "))
-		return 0
-	}
+	sub := &Executor{env: ex.env, positional: ex.positional}
+	code := sub.execute(stmt)
 
-	// Fallback: run normally (stdout not redirected for complex statements)
-	return ex.execute(stmt)
+	os.Stdin = savedIn
+	os.Stdout = savedOut
+	inR.Close()
+	if !last {
+		outW.Close()
+		<-done
+		outR.Close()
+	}
+	return code, captured
 }
 
 // --- CHAIN: cmd1 && cmd2, cmd1 || cmd2, cmd1 & cmd2 ---
@@ -605,6 +605,11 @@ func (ex *Executor) execSet(s *parser.SetStatement) int {
 
 func (ex *Executor) execIf(s *parser.IfStatement) int {
 	result := ex.evalCondition(s.Condition)
+	if ex.abortPending {
+		// Malformed condition (e.g. empty unquoted operand): the script is
+		// aborting — run neither branch.
+		return 1
+	}
 	if s.Not {
 		result = !result
 	}
@@ -627,8 +632,26 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 		return left == right
 
 	case *parser.NumericCompare:
-		left := stripOuterQuotes(ex.expandParts(c.Left))
-		right := stripOuterQuotes(ex.expandParts(c.Right))
+		leftRaw := ex.expandParts(c.Left)
+		rightRaw := ex.expandParts(c.Right)
+		// An UNQUOTED operand that expands to nothing malforms the IF on real
+		// cmd.exe: it prints `<token> was unexpected at this time.` and aborts
+		// the batch script. (A quoted empty operand `""` stays a valid token
+		// and falls through to string comparison below.)
+		if strings.TrimSpace(leftRaw) == "" || strings.TrimSpace(rightRaw) == "" {
+			other := strings.TrimSpace(rightRaw)
+			if other == "" {
+				other = strings.TrimSpace(leftRaw)
+			}
+			if other == "" {
+				other = c.Op
+			}
+			fmt.Fprintf(os.Stderr, "%s was unexpected at this time.\n", other)
+			ex.abortPending = true
+			return false
+		}
+		left := stripOuterQuotes(leftRaw)
+		right := stripOuterQuotes(rightRaw)
 		// CMD behavior: try numeric first, fall back to string comparison
 		lNum, lErr := strconv.Atoi(strings.TrimSpace(left))
 		rNum, rErr := strconv.Atoi(strings.TrimSpace(right))
@@ -724,22 +747,15 @@ func (ex *Executor) execGoto(s *parser.GotoStatement) int {
 			ex.gotoPending = true
 			return 0
 		}
-		fmt.Fprintf(os.Stderr, "GOTO-DBG: label %q not in index (len=%d), lines=%d. Index keys:", label, len(ex.labelIdx), len(ex.lines))
-		for k := range ex.labelIdx {
-			fmt.Fprintf(os.Stderr, " %s", k)
-		}
-		fmt.Fprintln(os.Stderr)
-		// Fallback: linear scan
+		// Fallback: linear scan (belt and braces if the index missed it)
 		for i, sl := range ex.lines {
 			if sl.label == label {
-				fmt.Fprintf(os.Stderr, "GOTO-DBG: found %q at line %d via linear scan!\n", label, i)
 				ex.pc = i + 1
 				ex.gotoPending = true
 				return 0
 			}
 		}
-		fmt.Fprintf(os.Stderr, "Label not found: %s\n", label)
-		return 1
+		return ex.missingLabel(strings.TrimPrefix(raw, ":"))
 	}
 
 	// Search in pre-parsed statements (interactive/RunStmts mode)
@@ -751,7 +767,15 @@ func (ex *Executor) execGoto(s *parser.GotoStatement) int {
 			}
 		}
 	}
-	fmt.Fprintf(os.Stderr, "Label not found: %s\n", s.Label)
+	return ex.missingLabel(strings.TrimPrefix(raw, ":"))
+}
+
+// missingLabel reports a CALL/GOTO target that doesn't exist and aborts the
+// current batch file — cmd.exe terminates the script (control returns to the
+// caller) with errorlevel 1.
+func (ex *Executor) missingLabel(label string) int {
+	fmt.Fprintf(os.Stderr, "The system cannot find the batch label specified - %s\n", label)
+	ex.abortPending = true
 	return 1
 }
 
@@ -766,7 +790,10 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 		cleanup := ex.applyRedirects(s.Redirects)
 		defer cleanup()
 	}
-	first := ex.expandParts(s.Args[0])
+	// The call target is dequoted (cmd.exe %~0-style): `call "path with spaces"`
+	// must open the file, not a name with literal quotes. Positional args keep
+	// their quotes so %1 vs %~1 still differ inside the callee.
+	first := stripOuterQuotes(ex.expandParts(s.Args[0]))
 
 	// Expand remaining args as positional params for the call. An unquoted
 	// expansion that yields spaces (e.g. `call :x !list!` where list="2 3")
@@ -817,6 +844,11 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 								break
 							}
 						}
+						if ex.abortPending {
+							// Missing label / malformed IF inside the subroutine:
+							// propagate so the whole file unwinds (cmd.exe).
+							break
+						}
 						if done || ex.exitPending {
 							ex.exitPending = false
 							break
@@ -844,6 +876,9 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 							break
 						}
 						code = ex.execute(stmt)
+						if ex.abortPending {
+							break
+						}
 					}
 					ex.pc = savedPC
 					ex.positional = savedPos
@@ -852,8 +887,14 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 			}
 		}
 		ex.positional = savedPos
-		fmt.Fprintf(os.Stderr, "Label not found: %s\n", first)
-		return 1
+		return ex.missingLabel(first[1:])
+	}
+
+	// CALL of an internal command (call set, call echo, ...) re-dispatches to
+	// the builtin with one extra round of %-expansion — the classic batch
+	// double-expansion idiom: `call set "y=%%x%%"` assigns the value of x.
+	if code, handled := ex.callBuiltin(first, s); handled {
+		return code
 	}
 
 	// CALL script.bat [args...]
@@ -868,9 +909,117 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 	return sub.RunFile(scriptPath, scriptArgs)
 }
 
+// callBuiltin handles CALL of an internal command. cmd.exe restarts the
+// command line with one extra round of variable expansion: `%%` collapses to
+// `%`, then delayed !VAR! refs and a second %VAR% pass apply. Returns
+// handled=false when the target isn't an internal command (so CALL falls
+// through to script resolution).
+//
+// Exception: `call set <args>` with no `=` and no switch is NOT dispatched to
+// the builtin — plain-name args can't be a SET assignment, and batch suites
+// in the wild (e.g. gw-batsic's stl module) use `call set <verb> ...` to
+// invoke a script named set.bat from PATH.
+func (ex *Executor) callBuiltin(first string, s *parser.CallStatement) (int, bool) {
+	upper := strings.ToUpper(first)
+	lookup := upper
+	// `call echo.` / `call echo(text` — the echo idioms glue onto the word.
+	if strings.HasPrefix(upper, "ECHO.") || strings.HasPrefix(upper, "ECHO(") {
+		lookup = "ECHO"
+	}
+	if _, isBuiltin := builtins.Registry[lookup]; !isBuiltin {
+		return 0, false
+	}
+	text := s.RawText
+	if text == "" {
+		// Token-only parse (no raw line available): best-effort reassembly.
+		var parts []string
+		for _, arg := range s.Args {
+			parts = append(parts, ex.expandParts(arg))
+		}
+		text = strings.Join(parts, " ")
+	} else {
+		text = ex.expandCallText(text)
+	}
+
+	if upper == "SET" {
+		rest := ""
+		if idx := strings.IndexAny(text, " \t"); idx >= 0 {
+			rest = strings.TrimSpace(text[idx+1:])
+		}
+		// `call set name=value`, `call set /A ...`, `call set` (list all) and
+		// `call set NAME` (single word: variable query) go to the builtin.
+		// Multiple plain words can't be a valid SET invocation — they're a
+		// script named set.bat on PATH (gw-batsic's stl module does this).
+		looksLikeSet := rest == "" || strings.ContainsRune(rest, '=') ||
+			strings.HasPrefix(rest, "/") || !strings.ContainsAny(rest, " \t")
+		if !looksLikeSet {
+			return 0, false
+		}
+	}
+
+	// Bangs were already resolved by the extra expansion round; parse with
+	// delayed expansion off so values containing '!' aren't re-expanded.
+	stmts, err := parser.ParseLineWithOpts(text, false)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Parse error: %v\n", err)
+		return 1, true
+	}
+	code := 0
+	for _, stmt := range stmts {
+		code = ex.execute(stmt)
+		if ex.shouldStop() {
+			break
+		}
+	}
+	return code, true
+}
+
+// expandCallText performs CALL's extra expansion round over the raw command
+// text: %%X of an enclosing FOR loop substitutes the loop value, other %%
+// pairs collapse to a single %, delayed !VAR! refs expand, then a second
+// %VAR% expansion pass runs (this is what makes `%%x%%` reach SET as the
+// value of x).
+func (ex *Executor) expandCallText(text string) string {
+	var sb strings.Builder
+	i := 0
+	for i < len(text) {
+		if text[i] == '%' && i+1 < len(text) && text[i+1] == '%' {
+			if i+2 < len(text) {
+				ch := text[i+2]
+				isLetter := (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')
+				nextAlnum := i+3 < len(text) &&
+					((text[i+3] >= 'a' && text[i+3] <= 'z') ||
+						(text[i+3] >= 'A' && text[i+3] <= 'Z') ||
+						(text[i+3] >= '0' && text[i+3] <= '9') || text[i+3] == '_')
+				if isLetter && !nextAlnum && ex.isActiveForVar(string(ch)) {
+					sb.WriteString(ex.env.Get(string(ch)))
+					i += 3
+					continue
+				}
+			}
+			sb.WriteByte('%')
+			i += 2
+			continue
+		}
+		sb.WriteByte(text[i])
+		i++
+	}
+	out := sb.String()
+	if ex.env.DelayedExpansion {
+		out = expander.ExpandBangs(out, ex.env)
+	}
+	return expander.ExpandPercent(out, ex.env, ex.positional)
+}
+
 // --- FOR ---
 
 func (ex *Executor) execFor(s *parser.ForStatement) int {
+	// Track the loop variable so CALL's extra expansion round can tell a
+	// FOR-variable ref (%%i) apart from the %%-escape in `call set "y=%%x%%"`.
+	depth := len(ex.activeForVars)
+	ex.activeForVars = append(ex.activeForVars, s.Variable)
+	defer func() { ex.activeForVars = ex.activeForVars[:depth] }()
+
 	switch s.Kind {
 	case parser.ForRange:
 		return ex.execForRange(s)
@@ -967,6 +1116,9 @@ func (ex *Executor) execForRange(s *parser.ForStatement) int {
 	for i := start; (step > 0 && i <= end) || (step < 0 && i >= end); i += step {
 		ex.env.Set(s.Variable, fmt.Sprintf("%d", i))
 		code = ex.RunStmts(s.Body, nil)
+		if ex.abortPending {
+			break
+		}
 	}
 	return code
 }
@@ -1295,6 +1447,22 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 
 	code := 0
 	baseVar := strings.ToUpper(s.Variable)
+	if baseVar == "" {
+		// Malformed FOR /F without a loop variable.
+		fmt.Fprintln(os.Stderr, "The syntax of the command is incorrect.")
+		return 1
+	}
+
+	// Register the derived token variables (%%a → %%a,%%b,%%c for tokens=1,2,3)
+	// as active FOR variables for CALL's extra expansion round.
+	depth := len(ex.activeForVars)
+	for i := range opts.tokens {
+		if i == 0 {
+			continue // base variable already registered by execFor
+		}
+		ex.activeForVars = append(ex.activeForVars, string(rune(baseVar[0])+rune(i)))
+	}
+	defer func() { ex.activeForVars = ex.activeForVars[:depth] }()
 
 	for _, line := range lines {
 		// FOR /F skips blank lines entirely (matches cmd.exe).
@@ -1384,16 +1552,23 @@ func (ex *Executor) execSimple(s *parser.SimpleCommand) int {
 		return 0
 	}
 
-	// Expand all args, strip quotes, and convert backslash paths
+	// Expand all args and strip quotes
 	args := make([]string, 0, len(s.Args))
 	for _, part := range s.Args {
 		a := ex.expandParts([]parser.WordPart{part})
 		a = strings.Trim(a, "\"")
-		a = strings.ReplaceAll(a, "\\", "/")
 		args = append(args, a)
 	}
 
 	cmdName := strings.ToUpper(args[0])
+
+	// Convert backslash paths — except for FINDSTR, whose patterns use \ as a
+	// regex escape (\< \>); it converts its own file args internally.
+	if cmdName != "FINDSTR" {
+		for i := range args {
+			args[i] = strings.ReplaceAll(args[i], "\\", "/")
+		}
+	}
 
 	// Builtin?
 	if fn, ok := builtins.Registry[cmdName]; ok {
@@ -1583,6 +1758,15 @@ func joinBlocks(lines []scriptLine) []scriptLine {
 // Returns the resolved path and true if found.
 func (ex *Executor) resolveBat(name string) (string, bool) {
 	name = strings.ReplaceAll(name, "\\", "/")
+	// Strip a drive-letter prefix (C:/foo → /foo) like RunFile does, so
+	// extension probing works for Windows-style absolute paths.
+	if len(name) >= 2 && name[1] == ':' &&
+		((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z')) {
+		name = name[2:]
+		if name == "" {
+			name = "/"
+		}
+	}
 	lower := strings.ToLower(name)
 	hasBatExt := strings.HasSuffix(lower, ".bat") || strings.HasSuffix(lower, ".cmd")
 

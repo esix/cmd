@@ -53,12 +53,18 @@ func (p *parser) parseStatements() ([]Statement, error) {
 			p.consume()
 			continue
 		}
+		posBefore := p.pos
 		stmt, err := p.parseChain()
 		if err != nil {
 			return nil, err
 		}
 		if stmt != nil {
 			stmts = append(stmts, stmt)
+		}
+		// Guarantee progress: a stray token the chain parser won't consume
+		// (e.g. an unmatched ')') must not spin this loop forever.
+		if p.pos == posBefore {
+			p.consume()
 		}
 	}
 	return stmts, nil
@@ -71,10 +77,9 @@ func attachRedirects(stmt Statement, leading []Redirect) {
 	}
 	switch s := stmt.(type) {
 	case *EchoStatement:
+		// Leading redirects were consumed before parseEcho ran, so the echo's
+		// verbatim RawText (which preserves spacing) remains valid.
 		s.Redirects = append(leading, s.Redirects...)
-		// Verbatim text can't represent the redirect target cleanly, so fall
-		// back to the token-based args when a redirect is attached.
-		s.HasRaw = false
 	case *SimpleCommand:
 		s.Redirects = append(leading, s.Redirects...)
 	case *SetStatement:
@@ -263,12 +268,17 @@ func (p *parser) parseBlock() (Statement, error) {
 		// Inside a block, each line is a separate statement. The block-line
 		// marker (\x01) and "&" both act as statement separators here, so
 		// we should NOT chain through "&" within the block.
+		posBefore := p.pos
 		stmt, err := p.parseIfChain()
 		if err != nil {
 			return nil, err
 		}
 		if stmt != nil {
 			stmts = append(stmts, stmt)
+		}
+		// Guarantee progress on tokens the chain parser won't consume.
+		if p.pos == posBefore {
+			p.consume()
 		}
 	}
 	if p.peek().Kind == lexer.RPAREN {
@@ -697,10 +707,24 @@ func (p *parser) parseGoto() (Statement, error) {
 
 func (p *parser) parseCall() (Statement, error) {
 	p.consume()
+	// Record where the args start so we can capture their verbatim text.
+	rawStart := -1
+	if t := p.peek(); t.Kind != lexer.EOF {
+		rawStart = t.Pos
+	}
 	// Each whitespace-separated token is one argument. collectWordGroups
 	// keeps the parts of a single token (e.g. "!_path!") together so a quoted
 	// delayed-expansion argument isn't split into multiple positional params.
 	args := p.collectWordGroups()
+	// The token after the args (redirect, &, |, ), or EOF) bounds the raw text.
+	rawEnd := len(p.raw)
+	if t := p.peek(); t.Kind != lexer.EOF && t.Pos < rawEnd {
+		rawEnd = t.Pos
+	}
+	rawText := ""
+	if rawStart >= 0 && rawStart < rawEnd && rawEnd <= len(p.raw) {
+		rawText = strings.TrimSpace(p.raw[rawStart:rawEnd])
+	}
 	// Collect trailing redirections (e.g. CALL foo > out.txt 2>&1).
 	var redirects []Redirect
 	for p.peek().Kind == lexer.REDIRECTION {
@@ -711,7 +735,7 @@ func (p *parser) parseCall() (Statement, error) {
 		}
 		redirects = append(redirects, Redirect{Op: op, File: file})
 	}
-	return &CallStatement{Args: args, Redirects: redirects}, nil
+	return &CallStatement{Args: args, Redirects: redirects, RawText: rawText}, nil
 }
 
 // --- FOR ---

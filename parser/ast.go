@@ -106,6 +106,7 @@ func (*GotoStatement) statementNode() {}
 type CallStatement struct {
 	Args      [][]WordPart // each element is one argument (group of parts); Args[0] is the script/label
 	Redirects []Redirect
+	RawText   string // verbatim args text (incl. command word); used for CALL-of-builtin re-expansion
 }
 
 func (*CallStatement) statementNode() {}

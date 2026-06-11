@@ -157,7 +157,9 @@ func tildeExpand(digit int, mods string, positional []string) string {
 		if strings.Contains(mods, "d") && strings.HasPrefix(dir, "/") {
 			dir = strings.TrimPrefix(dir, "/")
 		}
-		if !strings.HasSuffix(dir, "/") {
+		// A root-level file leaves dir empty after the strip; the "d" part
+		// already supplied the "/" (avoids "%~dp1" of /file → "//").
+		if dir != "" && !strings.HasSuffix(dir, "/") {
 			dir += "/"
 		}
 		result += dir
