@@ -23,7 +23,7 @@ func Set(args []string, e *env.Env) int {
 		}
 		sort.Strings(keys)
 		for _, k := range keys {
-			fmt.Printf("%s=%s\n", k, vars[k])
+			fmt.Printf("%s=%s\n", e.DisplayName(k), vars[k])
 		}
 		return 0
 	}
@@ -92,12 +92,16 @@ func Set(args []string, e *env.Env) int {
 		// Display variables matching the prefix
 		prefix := strings.ToUpper(raw)
 		vars := e.All()
-		found := false
-		for k, v := range vars {
+		keys := make([]string, 0, len(vars))
+		for k := range vars {
 			if strings.HasPrefix(k, prefix) {
-				fmt.Printf("%s=%s\n", k, v)
-				found = true
+				keys = append(keys, k)
 			}
+		}
+		sort.Strings(keys)
+		found := len(keys) > 0
+		for _, k := range keys {
+			fmt.Printf("%s=%s\n", e.DisplayName(k), vars[k])
 		}
 		if !found {
 			fmt.Printf("Environment variable %s not defined\n", raw)

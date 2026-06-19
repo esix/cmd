@@ -30,6 +30,10 @@ type parser struct {
 	tokens []lexer.Token
 	pos    int
 	raw    string // original line text (for tokens that need exact slicing)
+	// blockDepth tracks how many parenthesized blocks enclose the current
+	// position: a ')' only acts as a block closer when blockDepth > 0,
+	// otherwise (e.g. in `echo === LL(1) ===` at top level) it is text.
+	blockDepth int
 }
 
 func (p *parser) peek() lexer.Token {
@@ -259,6 +263,8 @@ func (p *parser) parseOne() (Statement, error) {
 
 func (p *parser) parseBlock() (Statement, error) {
 	p.consume() // consume (
+	p.blockDepth++
+	defer func() { p.blockDepth-- }()
 	var stmts []Statement
 	for p.peek().Kind != lexer.RPAREN && p.peek().Kind != lexer.EOF {
 		if p.peek().Kind == lexer.AMPERSAND {
@@ -311,7 +317,7 @@ func (p *parser) parseEcho() (Statement, error) {
 		}
 	}
 
-	args := p.collectWordGroups()
+	args := p.collectEchoWordGroups()
 	// The token right after the args marks where the echo body ends
 	// (RPAREN, &, |, redirect, block-marker, or EOF). Use its position to
 	// bound the verbatim text so we don't capture a block's closing ")".
@@ -573,7 +579,10 @@ func (p *parser) parseCondition() (Condition, error) {
 
 		if upper == "DEFINED" {
 			p.consume()
-			name := p.consume().Value
+			// The name may contain !var! or %%a parts (e.g.
+			// `if defined table.!_lhs!.%%a`) — collect the whole
+			// word and expand it at evaluation time, like EXIST.
+			name := p.collectOneWordParts()
 			return &DefinedCondition{Name: name}, nil
 		}
 
@@ -930,6 +939,41 @@ func (p *parser) collectWordGroups() [][]WordPart {
 		} else {
 			groups = append(groups, parts)
 		}
+	}
+	return groups
+}
+
+// collectEchoWordGroups is collectWordGroups for ECHO bodies: outside any
+// parenthesized block cmd.exe treats ')' as literal text (it only closes a
+// block), so `echo === LL(1) Parse Table ===` prints in full at top level.
+func (p *parser) collectEchoWordGroups() [][]WordPart {
+	var groups [][]WordPart
+	appendTok := func(tok lexer.Token, parts []WordPart) {
+		if !tok.SpaceBefore && len(groups) > 0 {
+			groups[len(groups)-1] = append(groups[len(groups)-1], parts...)
+		} else {
+			groups = append(groups, parts)
+		}
+	}
+	// NOTE: not atEnd() — that helper treats ')' as a terminator, which is
+	// exactly the case this function must look past at top level.
+	for p.peek().Kind != lexer.EOF {
+		tok := p.peek()
+		if tok.Kind == lexer.PIPE || tok.Kind == lexer.REDIRECTION ||
+			tok.Kind == lexer.AMPERSAND || tok.Kind == lexer.AND ||
+			tok.Kind == lexer.OR {
+			break
+		}
+		if tok.Kind == lexer.RPAREN {
+			if p.blockDepth > 0 {
+				break
+			}
+			p.consume()
+			appendTok(tok, parseWordParts(")"))
+			continue
+		}
+		p.consume()
+		appendTok(tok, tokenToParts(tok))
 	}
 	return groups
 }

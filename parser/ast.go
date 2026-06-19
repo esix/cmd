@@ -84,7 +84,7 @@ type ExistCondition struct{ Path []WordPart }
 
 func (*ExistCondition) conditionNode() {}
 
-type DefinedCondition struct{ Name string }
+type DefinedCondition struct{ Name []WordPart }
 
 func (*DefinedCondition) conditionNode() {}
 

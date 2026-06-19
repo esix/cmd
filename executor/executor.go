@@ -376,6 +376,57 @@ func (ex *Executor) execPipe(s *parser.PipeStatement) int {
 	return code
 }
 
+// internalForFSources lists first words of FOR /F ('command') sources that
+// must run through the port's own engine rather than sh — sh either lacks
+// them or (like `set`) shadows them with an incompatible shell builtin.
+var internalForFSources = map[string]bool{
+	"SET": true, "ECHO": true, "TYPE": true, "FINDSTR": true,
+	"VER": true, "CALL": true, "IF": true, "FOR": true,
+}
+
+// runInternalCapture executes a FOR /F ('command') source via a child
+// executor with stdout captured (same technique as runPipeStage) when its
+// first word is an internal command. Returns ok=false for anything else so
+// the caller can fall back to sh.
+func (ex *Executor) runInternalCapture(cmdStr string) (string, bool) {
+	trimmed := strings.TrimSpace(cmdStr)
+	first := trimmed
+	if i := strings.IndexAny(trimmed, " \t"); i >= 0 {
+		first = trimmed[:i]
+	}
+	upper := strings.ToUpper(first)
+	if strings.HasPrefix(upper, "ECHO.") || strings.HasPrefix(upper, "ECHO(") {
+		upper = "ECHO"
+	}
+	if !internalForFSources[upper] {
+		if _, ok := builtins.Registry[upper]; !ok {
+			return "", false
+		}
+	}
+	stmts, err := parser.ParseLineWithOpts(cmdStr, ex.env.DelayedExpansion)
+	if err != nil {
+		return "", false
+	}
+	savedOut := os.Stdout
+	outR, outW, err := os.Pipe()
+	if err != nil {
+		return "", false
+	}
+	os.Stdout = outW
+	var captured []byte
+	done := make(chan struct{})
+	go func() { captured, _ = io.ReadAll(outR); close(done) }()
+	sub := &Executor{env: ex.env, positional: ex.positional}
+	for _, st := range stmts {
+		sub.execute(st)
+	}
+	os.Stdout = savedOut
+	outW.Close()
+	<-done
+	outR.Close()
+	return string(captured), true
+}
+
 // runPipeStage executes one pipeline segment. stdin is fed from the previous
 // segment's buffered output; a non-final segment's stdout is captured and
 // returned, the final segment writes to the real stdout.
@@ -690,7 +741,7 @@ func (ex *Executor) evalCondition(cond parser.Condition) bool {
 		}
 
 	case *parser.DefinedCondition:
-		return ex.env.Get(c.Name) != ""
+		return ex.env.Get(ex.expandParts(c.Name)) != ""
 
 	case *parser.ExistCondition:
 		path := ex.expandParts(c.Path)
@@ -1401,6 +1452,11 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 			cmdStr = strings.ReplaceAll(cmdStr, "\\", "/")
 			// Handle Windows `dir` internally; sh has no such command.
 			if out, ok := runDirCommand(cmdStr); ok {
+				lines = strings.Split(strings.TrimRight(out, "\r\n"), "\n")
+			} else if out, ok := ex.runInternalCapture(cmdStr); ok {
+				// Internal commands — notably `set <prefix>` enumeration —
+				// must run in the port's own engine: sh's `set` is a
+				// different builtin and would capture nothing.
 				lines = strings.Split(strings.TrimRight(out, "\r\n"), "\n")
 			} else {
 				out, err := exec.Command("sh", "-c", cmdStr).Output()
