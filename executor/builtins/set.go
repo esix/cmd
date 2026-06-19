@@ -28,60 +28,68 @@ func Set(args []string, e *env.Env) int {
 		return 0
 	}
 
-	// SET /A arithmetic
+	// SET /A arithmetic.  cmd.exe accepts a comma-separated list of
+	// assignments/expressions evaluated left to right (e.g.
+	// `set /a "a+=1,b+=2"`); later parts see earlier assignments.
 	if strings.ToUpper(args[0]) == "/A" {
 		raw := strings.Join(args[1:], "")
-		eqIdx := strings.IndexByte(raw, '=')
-		if eqIdx == -1 {
-			// No assignment, just evaluate and print
-			result, err := evalArith(raw, e)
+		for _, part := range strings.Split(raw, ",") {
+			part = strings.TrimSpace(part)
+			if part == "" {
+				continue
+			}
+			eqIdx := strings.IndexByte(part, '=')
+			if eqIdx == -1 {
+				// No assignment: evaluate and print.
+				result, err := evalArith(part, e)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "SET /A: %v\n", err)
+					return 1
+				}
+				fmt.Println(result)
+				continue
+			}
+			name := strings.TrimSpace(part[:eqIdx])
+			expr := strings.TrimSpace(part[eqIdx+1:])
+
+			// Compound operators: +=, -=, *=, /=, %=
+			compoundOp := byte(0)
+			if len(name) > 0 {
+				last := name[len(name)-1]
+				if last == '+' || last == '-' || last == '*' || last == '/' || last == '%' {
+					compoundOp = last
+					name = strings.TrimSpace(name[:len(name)-1])
+				}
+			}
+
+			result, err := evalArith(expr, e)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "SET /A: %v\n", err)
 				return 1
 			}
-			fmt.Println(result)
-			return 0
-		}
-		name := strings.TrimSpace(raw[:eqIdx])
-		expr := strings.TrimSpace(raw[eqIdx+1:])
 
-		// Check for compound operators: +=, -=, *=, /=, %=
-		compoundOp := byte(0)
-		if len(name) > 0 {
-			last := name[len(name)-1]
-			if last == '+' || last == '-' || last == '*' || last == '/' || last == '%' {
-				compoundOp = last
-				name = strings.TrimSpace(name[:len(name)-1])
-			}
-		}
-
-		result, err := evalArith(expr, e)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "SET /A: %v\n", err)
-			return 1
-		}
-
-		if compoundOp != 0 {
-			current, _ := strconv.Atoi(e.Get(name))
-			switch compoundOp {
-			case '+':
-				result = current + result
-			case '-':
-				result = current - result
-			case '*':
-				result = current * result
-			case '/':
-				if result != 0 {
-					result = current / result
-				}
-			case '%':
-				if result != 0 {
-					result = current % result
+			if compoundOp != 0 {
+				current, _ := strconv.Atoi(e.Get(name))
+				switch compoundOp {
+				case '+':
+					result = current + result
+				case '-':
+					result = current - result
+				case '*':
+					result = current * result
+				case '/':
+					if result != 0 {
+						result = current / result
+					}
+				case '%':
+					if result != 0 {
+						result = current % result
+					}
 				}
 			}
-		}
 
-		e.Set(name, strconv.Itoa(result))
+			e.Set(name, strconv.Itoa(result))
+		}
 		return 0
 	}
 
