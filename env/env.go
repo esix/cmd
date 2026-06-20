@@ -7,7 +7,9 @@ package env
 
 import (
 	"fmt"
+	"math/rand"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -61,11 +63,21 @@ func New() *Env {
 // Get returns the value of a variable (case-insensitive).
 // Missing variables return "".
 func (e *Env) Get(name string) string {
-	// Magic variable
-	if strings.ToUpper(name) == "ERRORLEVEL" {
-		return fmt.Sprint(e.ExitCode) // see below — we'll fix the import
+	upper := strings.ToUpper(name)
+	// Magic variables
+	if upper == "ERRORLEVEL" {
+		return fmt.Sprint(e.ExitCode)
 	}
-	return e.vars[strings.ToUpper(name)]
+	// %RANDOM%: a fresh pseudo-random integer 0..32767 on each read, unless
+	// the user has explicitly assigned RANDOM (which shadows the dynamic one,
+	// matching cmd.exe).  The global rand source is auto-seeded (Go >=1.20).
+	if upper == "RANDOM" {
+		if v, ok := e.vars["RANDOM"]; ok {
+			return v
+		}
+		return strconv.Itoa(rand.Intn(32768))
+	}
+	return e.vars[upper]
 }
 
 // Set stores a variable.  The original-case spelling is remembered the
