@@ -22,10 +22,24 @@ func ExpandPercent(line string, e *env.Env, positional []string) string {
 		}
 
 		// %% → literal %
-		// %% handling:
-		// %%X (single letter, not followed by alnum) → FOR variable, keep %%X
-		// Otherwise → keep %% intact (SET /A modulo or literal)
+		// %% handling (the FOR variable value isn't known at line-expansion
+		// time, so these are preserved verbatim for the parser):
+		//   %%X            (single letter, not followed by alnum) → FOR var
+		//   %%~<mods><ltr> → tilde-modified FOR var (e.g. %%~nf)
+		//   otherwise      → keep %% intact (SET /A modulo or literal)
 		if i+1 < len(line) && line[i+1] == '%' {
+			// %%~<modifiers><letter> — emit the whole token verbatim.
+			if i+2 < len(line) && line[i+2] == '~' {
+				j := i + 3
+				for j < len(line) && ((line[j] >= 'a' && line[j] <= 'z') || (line[j] >= 'A' && line[j] <= 'Z')) {
+					j++
+				}
+				if j > i+3 {
+					sb.WriteString(line[i:j])
+					i = j
+					continue
+				}
+			}
 			if i+2 < len(line) {
 				ch := line[i+2]
 				isLetter := (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z')

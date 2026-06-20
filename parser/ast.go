@@ -218,10 +218,13 @@ type DelayedVarPart struct {
 
 func (*DelayedVarPart) wordPartNode() {}
 
-// TildeVarPart represents %~1, %~dp0, etc. (parameter with tilde modifiers).
+// TildeVarPart represents a tilde-modified reference:
+//   - call argument form: %~1, %~dp0 (Name == "", value from Positional)
+//   - FOR variable form:  %%~nf, %%~dpf (Name == "f", value from the env var)
 type TildeVarPart struct {
-	Positional int    // the digit (0-9)
+	Positional int    // the digit (0-9); used when Name == ""
 	Modifiers  string // modifier letters: d, p, n, x, f, s, a, t, z, or empty (strip quotes)
+	Name       string // non-empty for FOR-variable form (%%~nf); value read from env
 }
 
 func (*TildeVarPart) wordPartNode() {}

@@ -188,9 +188,21 @@ func (l *lexer) readPercentVar() Token {
 		return Token{Kind: PERCENT_VAR, Value: val, Pos: start}
 	}
 
-	// %% — either a FOR-loop variable (%%I) or a literal %
+	// %% — FOR-loop variable (%%I), tilde-modified FOR variable (%%~nf), or
+	// a literal %.
 	if l.pos < len(l.input) && l.input[l.pos] == '%' {
 		l.pos++ // consume second %
+		// %%~<modifiers><letter> — FOR variable with tilde modifiers
+		if l.pos < len(l.input) && l.input[l.pos] == '~' {
+			var sb strings.Builder
+			sb.WriteString("%%~")
+			l.pos++ // consume ~
+			for l.pos < len(l.input) && (isAlphaNum(l.input[l.pos]) || l.input[l.pos] == '$') {
+				sb.WriteByte(l.input[l.pos])
+				l.pos++
+			}
+			return Token{Kind: PERCENT_VAR, Value: sb.String(), Pos: start}
+		}
 		// %%X where X is a letter/digit → FOR variable token
 		if l.pos < len(l.input) && isAlphaNum(l.input[l.pos]) {
 			ch := l.input[l.pos]

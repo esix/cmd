@@ -1187,17 +1187,31 @@ func (ex *Executor) execForInList(s *parser.ForStatement) int {
 		if strings.TrimSpace(item) == "" {
 			continue
 		}
+		// A fully double-quoted item is one element even if it contains spaces
+		// (e.g. for %%f in ("my dir/*.bat")). Otherwise spaces separate items
+		// (e.g. for %%i in (!list!) where list expanded to "a b c").
 		var items []string
-		if strings.ContainsAny(item, " \t") {
+		if strings.HasPrefix(item, "\"") && strings.HasSuffix(item, "\"") && len(item) >= 2 {
+			items = []string{item}
+		} else if strings.ContainsAny(item, " \t") {
 			items = strings.Fields(item)
 		} else {
 			items = []string{item}
 		}
 		for _, it := range items {
-			// Check if item is a glob pattern
+			// A glob element (containing * or ?) is expanded against the
+			// filesystem. cmd.exe globs only wildcard elements; a no-match
+			// wildcard yields zero iterations (not the literal).
 			if strings.ContainsAny(it, "*?") {
-				matches, _ := filepath.Glob(it)
+				// Strip surrounding quotes and normalize backslashes so the
+				// pattern is a valid filesystem glob.
+				pat := strings.ReplaceAll(stripOuterQuotes(it), "\\", "/")
+				matches, _ := filepath.Glob(pat)
 				for _, m := range matches {
+					// Plain FOR matches files only (FOR /D matches directories).
+					if info, err := os.Stat(m); err == nil && info.IsDir() {
+						continue
+					}
 					ex.env.Set(s.Variable, m)
 					code = ex.RunStmts(s.Body, nil)
 					if ex.shouldStop() {
@@ -1205,6 +1219,8 @@ func (ex *Executor) execForInList(s *parser.ForStatement) int {
 					}
 				}
 			} else {
+				// Literal element: cmd.exe keeps surrounding quotes on the
+				// FOR variable (for %%i in ("a b") → %%i is "a b").
 				ex.env.Set(s.Variable, it)
 				code = ex.RunStmts(s.Body, nil)
 				if ex.shouldStop() {
@@ -1345,86 +1361,20 @@ func stripNulRedirect(cmd string) string {
 	return strings.TrimSpace(cmd)
 }
 
-// runDirCommand handles Windows `dir` invocations used by BAT scripts (notably
-// `dir /A-D /S /B pattern` for recursive bare file listing). Returns the output
-// and true if the command was a dir command we could handle.
+// runDirCommand handles Windows `dir` invocations captured by `for /f`
+// (notably `dir /A-D /S /B pattern`). Returns the newline-joined output and
+// true if the command was a `dir` we could handle. Delegates to
+// builtins.DirList so the standalone `dir` builtin and this path agree.
 func runDirCommand(cmdStr string) (string, bool) {
-	fields := strings.Fields(cmdStr)
+	fields := splitArgs(cmdStr)
 	if len(fields) == 0 || strings.ToLower(fields[0]) != "dir" {
 		return "", false
 	}
-
-	bare := false      // /B — bare format (just names/paths)
-	recursive := false // /S — recurse subdirectories
-	filesOnly := false // /A-D — exclude directories
-	var pattern string
-	for _, f := range fields[1:] {
-		upper := strings.ToUpper(f)
-		switch {
-		case upper == "/B":
-			bare = true
-		case upper == "/S":
-			recursive = true
-		case strings.HasPrefix(upper, "/A"):
-			if strings.Contains(upper, "-D") {
-				filesOnly = true
-			}
-		case strings.HasPrefix(f, "/"):
-			// ignore other flags
-		default:
-			pattern = strings.Trim(f, "\"")
-		}
-	}
-	if pattern == "" {
+	lines, _, ok := builtins.DirList(fields[1:])
+	if !ok {
 		return "", false
 	}
-	pattern = strings.ReplaceAll(pattern, "\\", "/")
-
-	// Split pattern into directory and glob component.
-	dir := filepath.Dir(pattern)
-	glob := filepath.Base(pattern)
-	if dir == "" {
-		dir = "."
-	}
-
-	var matches []string
-	if recursive {
-		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if info.IsDir() {
-				if filesOnly {
-					return nil // skip emitting directories
-				}
-				return nil
-			}
-			if ok, _ := filepath.Match(glob, filepath.Base(path)); ok {
-				abs, _ := filepath.Abs(path)
-				matches = append(matches, abs)
-			}
-			return nil
-		})
-	} else {
-		entries, _ := filepath.Glob(filepath.Join(dir, glob))
-		for _, m := range entries {
-			info, err := os.Stat(m)
-			if err != nil {
-				continue
-			}
-			if filesOnly && info.IsDir() {
-				continue
-			}
-			abs, _ := filepath.Abs(m)
-			matches = append(matches, abs)
-		}
-	}
-
-	if !bare {
-		// We only support bare format meaningfully; fall back if not /B.
-		return strings.Join(matches, "\n"), true
-	}
-	return strings.Join(matches, "\n"), true
+	return strings.Join(lines, "\n"), true
 }
 
 func (ex *Executor) execForTokens(s *parser.ForStatement) int {

@@ -2,7 +2,9 @@
 package expander
 
 import (
+	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/esix/cmd/env"
@@ -31,7 +33,12 @@ func ExpandWord(parts []parser.WordPart, e *env.Env, positional []string) string
 		case *parser.DelayedVarPart:
 			sb.WriteString(expandDelayedRef(pt.Name, e))
 		case *parser.TildeVarPart:
-			sb.WriteString(expandTilde(pt, positional))
+			if pt.Name != "" {
+				// FOR-variable form (%%~nf): value comes from the env var.
+				sb.WriteString(applyTildeMods(e.Get(pt.Name), pt.Modifiers))
+			} else {
+				sb.WriteString(expandTilde(pt, positional))
+			}
 		case *parser.SubstringVarPart:
 			sb.WriteString(expandSubstring(pt, e))
 		}
@@ -48,53 +55,70 @@ func ExpandArgs(argParts [][]parser.WordPart, e *env.Env, positional []string) [
 	return result
 }
 
-// expandTilde handles %~1, %~dp0, %~n1, etc.
+// expandTilde handles the call-argument tilde form %~1, %~dp0, %~n1, etc.
 func expandTilde(pt *parser.TildeVarPart, positional []string) string {
 	val := ""
 	if pt.Positional < len(positional) {
 		val = positional[pt.Positional]
 	}
-	if dbg := false; dbg {
-		// Hidden debug; enable by setting dbg true
-		_ = val
-	}
+	return applyTildeMods(val, pt.Modifiers)
+}
 
-	// No modifiers: just strip surrounding quotes
-	if pt.Modifiers == "" {
+// applyTildeMods applies cmd.exe path-decomposition modifiers (d p n x f s,
+// and the file-info modifiers z t a) to a path value. Shared by the
+// call-argument form (%~dp1) and the FOR-variable form (%%~dpf). With no
+// modifiers it just strips surrounding quotes.
+func applyTildeMods(val, modifiers string) string {
+	if modifiers == "" {
 		return stripQuotes(val)
 	}
 
-	result := ""
-	mods := strings.ToLower(pt.Modifiers)
-
-	// f = full path
-	if strings.Contains(mods, "f") {
-		abs, err := filepath.Abs(stripQuotes(val))
-		if err == nil {
-			return abs
-		}
-		return stripQuotes(val)
-	}
-
+	mods := strings.ToLower(modifiers)
 	path := stripQuotes(val)
-	// Resolve to absolute path so d/p modifiers return useful paths,
-	// matching Windows cmd.exe behavior where %~dp0 always gives full dir.
+	// Resolve to absolute so d/p/f return useful paths, matching cmd.exe where
+	// %~dp0 / %~f1 always give a fully-qualified result.
 	absPath := path
 	if abs, err := filepath.Abs(path); err == nil {
 		absPath = abs
 	}
 
-	// d = drive (on Unix, always / for absolute paths)
+	// File-info modifiers (size/time/attributes) are stat queries used on
+	// their own (e.g. %~zf, %~tf, %~af); handle them before the path build.
+	if strings.ContainsAny(mods, "atz") {
+		info, err := os.Stat(absPath)
+		if err != nil {
+			return ""
+		}
+		switch {
+		case strings.Contains(mods, "z"):
+			return strconv.FormatInt(info.Size(), 10)
+		case strings.Contains(mods, "t"):
+			return info.ModTime().Format("01/02/2006 03:04 PM")
+		case strings.Contains(mods, "a"):
+			return fileAttrString(info)
+		}
+	}
+
+	// f = full path (overrides the piecewise build). s (short name) has no
+	// 8.3 equivalent on Unix, so a lone s also yields the full path.
+	if strings.Contains(mods, "f") {
+		return absPath
+	}
+
+	result := ""
+	recognized := false
+	// d = drive (on Unix, "/" for an absolute path).
 	if strings.Contains(mods, "d") {
+		recognized = true
 		if filepath.IsAbs(absPath) {
 			result += "/"
 		}
 	}
-
-	// p = path (directory part of the absolute path)
+	// p = directory part of the absolute path.
 	if strings.Contains(mods, "p") {
+		recognized = true
 		dir := filepath.Dir(absPath)
-		// If d was already added "/", don't double the leading slash
+		// If d already added "/", don't double the leading slash.
 		if strings.Contains(mods, "d") && strings.HasPrefix(dir, "/") {
 			dir = strings.TrimPrefix(dir, "/")
 		}
@@ -103,25 +127,46 @@ func expandTilde(pt *parser.TildeVarPart, positional []string) string {
 			result += "/"
 		}
 	}
-
-	// n = file name without extension
+	// n = file name without extension.
 	if strings.Contains(mods, "n") {
+		recognized = true
 		base := filepath.Base(path)
 		ext := filepath.Ext(base)
 		result += strings.TrimSuffix(base, ext)
 	}
-
-	// x = extension only
+	// x = extension only.
 	if strings.Contains(mods, "x") {
+		recognized = true
 		result += filepath.Ext(path)
 	}
-
-	// If no recognized modifiers, just strip quotes
-	if result == "" {
-		return stripQuotes(val)
+	// s = short name: no 8.3 on Unix; if used alone, yield the full path.
+	if strings.Contains(mods, "s") {
+		recognized = true
+		if result == "" {
+			result = absPath
+		}
 	}
 
+	// No recognized modifier: fall back to the quote-stripped value. When a
+	// modifier WAS recognized, an empty result is legitimate (e.g. %~x of an
+	// extensionless file) and must be returned as-is.
+	if !recognized {
+		return stripQuotes(val)
+	}
 	return result
+}
+
+// fileAttrString builds a cmd.exe-style 9-char attribute string. Unix lacks
+// most DOS attributes; we approximate directory and read-only.
+func fileAttrString(info os.FileInfo) string {
+	b := []byte("---------")
+	if info.IsDir() {
+		b[0] = 'd'
+	}
+	if info.Mode().Perm()&0o200 == 0 {
+		b[1] = 'r'
+	}
+	return string(b)
 }
 
 // expandSubstring handles %VAR:~N% and %VAR:~N,M%.
@@ -239,6 +284,21 @@ func expandNestedPercents(s string, e *env.Env) string {
 		}
 		// %% followed by single letter — FOR variable: look up that letter as env var
 		if i+1 < len(s) && s[i+1] == '%' {
+			// %%~<modifiers><letter> — tilde-modified FOR variable.
+			if i+2 < len(s) && s[i+2] == '~' {
+				j := i + 3
+				for j < len(s) && ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z')) {
+					j++
+				}
+				if j > i+3 {
+					seq := s[i+3 : j] // modifiers + the FOR variable (last letter)
+					varCh := seq[len(seq)-1]
+					mods := seq[:len(seq)-1]
+					sb.WriteString(applyTildeMods(e.Get(string(varCh)), mods))
+					i = j
+					continue
+				}
+			}
 			if i+2 < len(s) {
 				ch := s[i+2]
 				if (ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') {

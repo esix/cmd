@@ -1104,6 +1104,20 @@ func parseWordParts(s string) []WordPart {
 		}
 
 		pct = nextIdx
+		// %%~<modifiers><letter> (FOR variable with tilde modifiers)
+		if pct+2 < len(s) && s[pct+1] == '%' && s[pct+2] == '~' {
+			j := pct + 3
+			for j < len(s) && ((s[j] >= 'a' && s[j] <= 'z') || (s[j] >= 'A' && s[j] <= 'Z')) {
+				j++
+			}
+			if j > pct+3 { // at least one letter (the FOR variable)
+				if p := forTildePart(s[pct:j]); p != nil {
+					parts = append(parts, p)
+					i = j
+					continue
+				}
+			}
+		}
 		// %%X (FOR variable: single letter, not followed by alnum)
 		if pct+2 < len(s) && s[pct+1] == '%' {
 			ch := s[pct+2]
@@ -1184,7 +1198,30 @@ func parseWordParts(s string) []WordPart {
 	return parts
 }
 
+// forTildePart parses a `%%~<modifiers><letter>` FOR-variable reference (the
+// trailing letter is the FOR variable; the preceding letters are modifiers).
+// Returns nil if raw is not such a reference.
+func forTildePart(raw string) *TildeVarPart {
+	if !strings.HasPrefix(raw, "%%~") {
+		return nil
+	}
+	rest := raw[3:]
+	if rest == "" {
+		return nil
+	}
+	varCh := rest[len(rest)-1]
+	if !((varCh >= 'a' && varCh <= 'z') || (varCh >= 'A' && varCh <= 'Z')) {
+		return nil
+	}
+	return &TildeVarPart{Name: string(varCh), Modifiers: rest[:len(rest)-1], Positional: -1}
+}
+
 func varPartFromToken(raw string) WordPart {
+	// %%~<modifiers><letter> — FOR variable with tilde modifiers
+	if p := forTildePart(raw); p != nil {
+		return p
+	}
+
 	// %~[modifiers]N — tilde parameter
 	if strings.HasPrefix(raw, "%~") {
 		rest := raw[2:]
