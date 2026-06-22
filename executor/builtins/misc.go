@@ -13,14 +13,23 @@ import (
 
 // Cd implements CD / CHDIR.
 func Cd(args []string, e *env.Env) int {
-	if len(args) == 0 {
+	// Drop a leading /D switch (cmd.exe: change drive+directory; the drive
+	// part is a no-op on Unix).
+	rest := make([]string, 0, len(args))
+	for _, a := range args {
+		if strings.EqualFold(a, "/d") {
+			continue
+		}
+		rest = append(rest, a)
+	}
+	if len(rest) == 0 {
 		wd, _ := os.Getwd()
 		fmt.Println(wd)
 		return 0
 	}
-	dir := toUnixPath(args[0])
+	dir := toUnixPath(rest[0])
 	if err := os.Chdir(dir); err != nil {
-		fmt.Fprintf(os.Stderr, "The system cannot find the path specified: %s\n", args[0])
+		fmt.Fprintf(os.Stderr, "The system cannot find the path specified: %s\n", rest[0])
 		return 1
 	}
 	return 0
@@ -93,19 +102,7 @@ func DirList(args []string) (lines []string, bare bool, ok bool) {
 	}
 
 	if recursive {
-		filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-			if err != nil || path == dir {
-				return nil
-			}
-			if info.IsDir() && filesOnly {
-				return nil
-			}
-			if m, _ := filepath.Match(glob, filepath.Base(path)); m {
-				abs, _ := filepath.Abs(path)
-				lines = append(lines, abs)
-			}
-			return nil
-		})
+		dirWalkBare(dir, glob, filesOnly, &lines)
 	} else {
 		entries, _ := filepath.Glob(filepath.Join(dir, glob))
 		for _, m := range entries {
@@ -118,9 +115,59 @@ func DirList(args []string) (lines []string, bare bool, ok bool) {
 			}
 			lines = append(lines, filepath.Base(m))
 		}
-		sort.Strings(lines)
+		sortNamesCI(lines)
 	}
 	return lines, bare, true
+}
+
+// dirWalkBare appends matching entries under dir (full paths) in cmd.exe
+// `dir /s /b` order: each directory's matching entries (sorted) first, then a
+// depth-first recursion into its subdirectories (sorted). Directories are
+// excluded from the output when filesOnly, but always traversed.
+func dirWalkBare(dir, glob string, filesOnly bool, out *[]string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	names := make([]string, len(entries))
+	for i, e := range entries {
+		names[i] = e.Name()
+	}
+	sortNamesCI(names)
+	// Matching entries in this directory.
+	for _, name := range names {
+		full := filepath.Join(dir, name)
+		info, err := os.Stat(full)
+		if err != nil {
+			continue
+		}
+		if info.IsDir() && filesOnly {
+			continue
+		}
+		if m, _ := filepath.Match(glob, name); m {
+			abs, _ := filepath.Abs(full)
+			*out = append(*out, abs)
+		}
+	}
+	// Recurse into subdirectories.
+	for _, name := range names {
+		full := filepath.Join(dir, name)
+		if info, err := os.Stat(full); err == nil && info.IsDir() {
+			dirWalkBare(full, glob, filesOnly, out)
+		}
+	}
+}
+
+// sortNamesCI sorts file names the way cmd.exe's `dir` does: case-insensitively,
+// with byte order as a stable tiebreaker.
+func sortNamesCI(names []string) {
+	sort.SliceStable(names, func(i, j int) bool {
+		li, lj := strings.ToLower(names[i]), strings.ToLower(names[j])
+		if li != lj {
+			return li < lj
+		}
+		return names[i] < names[j]
+	})
 }
 
 // isDirFlag reports whether arg is a `dir` switch (e.g. /B, /S, /A-D, /O:N)
