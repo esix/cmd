@@ -531,16 +531,12 @@ func (ex *Executor) execShift() int {
 // --- ECHO ---
 
 func (ex *Executor) execEcho(s *parser.EchoStatement) int {
-	if s.Newline {
-		fmt.Print("\r\n")
-		return 0
-	}
 	if s.TurnOn != nil {
 		ex.env.Echo = *s.TurnOn
 		return 0
 	}
 
-	// Handle redirections (e.g. ECHO error 1>&2)
+	// Resolve the output target from redirections (e.g. ECHO x >> file, 1>&2).
 	out := os.Stdout
 	for _, r := range s.Redirects {
 		file := cleanRedirectFile(r.File, ex.env)
@@ -548,16 +544,23 @@ func (ex *Executor) execEcho(s *parser.EchoStatement) int {
 		case "1>&2", ">&2":
 			out = os.Stderr
 		case ">", "1>":
-			f, err := os.Create(file)
-			if err == nil {
+			if f, err := os.Create(file); err == nil {
+				defer f.Close()
 				out = f
 			}
 		case ">>", "1>>":
-			f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-			if err == nil {
+			if f, err := os.OpenFile(file, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
+				defer f.Close()
 				out = f
 			}
 		}
+	}
+
+	// ECHO. / ECHO( with no text: a blank line — still honoring redirection
+	// (e.g. `echo.>> file` appends a CRLF).
+	if s.Newline {
+		fmt.Fprint(out, "\r\n")
+		return 0
 	}
 
 	// Prefer verbatim text (preserves leading/internal spacing) when available.

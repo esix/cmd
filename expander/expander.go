@@ -74,7 +74,10 @@ func applyTildeMods(val, modifiers string) string {
 	}
 
 	mods := strings.ToLower(modifiers)
-	path := stripQuotes(val)
+	// Normalize backslashes to forward slashes so filepath.Abs/Clean can
+	// resolve ".." segments (on Unix, "\" is not a separator, so "..\..\x"
+	// would otherwise stay literal). Consistent with the rest of the port.
+	path := strings.ReplaceAll(stripQuotes(val), "\\", "/")
 	// Resolve to absolute so d/p/f return useful paths, matching cmd.exe where
 	// %~dp0 / %~f1 always give a fully-qualified result.
 	absPath := path

@@ -208,10 +208,10 @@ func (p *parser) parseOne() (Statement, error) {
 		cmdName = strings.ToUpper(tok.Value)
 	}
 
-	// ECHO. (with dot, no space) prints a blank line
+	// ECHO. (with dot, no space) prints a blank line — honoring any redirect.
 	if strings.HasPrefix(cmdName, "ECHO.") {
 		p.consume()
-		return &EchoStatement{Newline: true}, nil
+		return &EchoStatement{Newline: true, Redirects: p.collectRedirects()}, nil
 	}
 
 	// ECHO( safe-echo idiom: `echo(text` is equivalent to `echo text`,
@@ -225,10 +225,11 @@ func (p *parser) parseOne() (Statement, error) {
 		}
 		// Collect any further space-separated args on the line.
 		groups = append(groups, p.collectWordGroups()...)
+		redirects := p.collectRedirects()
 		if len(groups) == 0 {
-			return &EchoStatement{Newline: true}, nil
+			return &EchoStatement{Newline: true, Redirects: redirects}, nil
 		}
-		return &EchoStatement{Args: groups}, nil
+		return &EchoStatement{Args: groups, Redirects: redirects}, nil
 	}
 
 	switch cmdName {
@@ -294,6 +295,21 @@ func (p *parser) parseBlock() (Statement, error) {
 }
 
 // --- ECHO ---
+
+// collectRedirects consumes a run of trailing redirection tokens
+// (e.g. `>> file`, `2>&1`, `1>&2`) and returns them.
+func (p *parser) collectRedirects() []Redirect {
+	var redirects []Redirect
+	for p.peek().Kind == lexer.REDIRECTION {
+		op := p.consume().Value
+		file := ""
+		if p.peek().Kind == lexer.WORD {
+			file = p.consume().Value
+		}
+		redirects = append(redirects, Redirect{Op: op, File: file})
+	}
+	return redirects
+}
 
 func (p *parser) parseEcho() (Statement, error) {
 	echoTok := p.consume() // consume ECHO
