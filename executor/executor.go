@@ -1317,17 +1317,34 @@ func parseForFOpts(optStr string) forFOpts {
 	return opts
 }
 
-// parseTokenSpec parses "1,2*" or "1*" or "1,2,3" into token indices.
-// -1 represents the wildcard (*) = rest of line.
+// parseTokenSpec parses a FOR /F tokens= spec into 1-based token indices.
+// Supports single numbers, comma lists, and M-N ranges, optionally with a
+// trailing * (rest-of-line) marker, e.g. "1", "1,3,5", "1-4", "2-3,7", "1,2*".
+// -1 represents the wildcard (*). Malformed parts are skipped (never producing
+// a 0/-negative index that would later index the field slice out of range).
 func parseTokenSpec(spec string) []int {
+	const maxToken = 128 // cmd.exe caps tokens well below this; guards huge ranges
 	var result []int
 	for _, part := range strings.Split(spec, ",") {
 		part = strings.TrimSpace(part)
 		wildcard := strings.HasSuffix(part, "*")
 		part = strings.TrimSuffix(part, "*")
 		if part != "" {
-			n, _ := strconv.Atoi(part)
-			result = append(result, n)
+			if dash := strings.IndexByte(part, '-'); dash > 0 {
+				// M-N range → M, M+1, ..., N
+				lo, err1 := strconv.Atoi(strings.TrimSpace(part[:dash]))
+				hi, err2 := strconv.Atoi(strings.TrimSpace(part[dash+1:]))
+				if err1 == nil && err2 == nil && lo >= 1 && hi >= lo {
+					if hi > maxToken {
+						hi = maxToken
+					}
+					for n := lo; n <= hi; n++ {
+						result = append(result, n)
+					}
+				}
+			} else if n, err := strconv.Atoi(part); err == nil && n >= 1 {
+				result = append(result, n)
+			}
 		}
 		if wildcard {
 			result = append(result, -1) // wildcard marker
@@ -1498,7 +1515,7 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 				} else {
 					ex.env.Set(varName, "")
 				}
-			} else if tokIdx-1 < len(fields) {
+			} else if tokIdx >= 1 && tokIdx-1 < len(fields) {
 				ex.env.Set(varName, fields[tokIdx-1])
 			} else {
 				ex.env.Set(varName, "")
