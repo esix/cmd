@@ -11,13 +11,14 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Env holds shell variables and the current exit code.
 type Env struct {
 	vars             map[string]string
 	names            map[string]string // UPPER key -> original-case name (cmd.exe preserves the case used at creation)
-	stack            []scope // for SETLOCAL / ENDLOCAL
+	stack            []scope           // for SETLOCAL / ENDLOCAL
 	ExitCode         int
 	FileMode         bool // true when executing a .bat file (affects %% vs % in FOR)
 	Echo             bool // ECHO ON / ECHO OFF
@@ -77,8 +78,31 @@ func (e *Env) Get(name string) string {
 		}
 		return strconv.Itoa(rand.Intn(32768))
 	}
+	// %DATE% / %TIME%: dynamic pseudo-vars read from the system clock, in
+	// cmd.exe's default (US) format, unless the user has explicitly assigned
+	// them (which shadows the dynamic value, matching cmd.exe).
+	//   %DATE% → "Mon 06/24/2026"   (weekday + MM/DD/YYYY)
+	//   %TIME% → "21:17:09.42"      (24-hour, space-padded hour, centiseconds)
+	if upper == "DATE" {
+		if v, ok := e.vars["DATE"]; ok {
+			return v
+		}
+		return now().Format("Mon 01/02/2006")
+	}
+	if upper == "TIME" {
+		if v, ok := e.vars["TIME"]; ok {
+			return v
+		}
+		t := now()
+		cs := t.Nanosecond() / 10_000_000 // centiseconds
+		return fmt.Sprintf("%2d:%02d:%02d.%02d", t.Hour(), t.Minute(), t.Second(), cs)
+	}
 	return e.vars[upper]
 }
+
+// now returns the current local time. A package-level indirection so tests can
+// pin the clock if needed.
+var now = time.Now
 
 // Set stores a variable.  The original-case spelling is remembered the
 // first time a name is created (cmd.exe keeps that case in SET listings).

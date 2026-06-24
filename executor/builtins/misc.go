@@ -53,6 +53,31 @@ func Pause(_ []string, _ *env.Env) int {
 // Rem is a no-op (comment).
 func Rem(_ []string, _ *env.Env) int { return 0 }
 
+// Date implements the DATE command. It prints the current date in cmd.exe's
+// default format ("Mon 06/24/2026") and returns. cmd.exe's bare `date` would
+// then prompt for a new date; this non-interactive port never prompts (so it
+// won't block a script), matching `date /t`.
+func Date(_ []string, _ *env.Env) int {
+	fmt.Print(time.Now().Format("Mon 01/02/2006") + "\r\n")
+	return 0
+}
+
+// Time implements the TIME command. `time /t` prints the 12-hour clock
+// ("09:17 PM"); bare `time` prints the full 24-hour value with centiseconds,
+// like %TIME%. Never prompts.
+func Time(args []string, _ *env.Env) int {
+	t := time.Now()
+	for _, a := range args {
+		if strings.EqualFold(a, "/t") {
+			fmt.Print(t.Format("03:04 PM") + "\r\n")
+			return 0
+		}
+	}
+	cs := t.Nanosecond() / 10_000_000
+	fmt.Printf("%2d:%02d:%02d.%02d\r\n", t.Hour(), t.Minute(), t.Second(), cs)
+	return 0
+}
+
 // DirList implements the subset of `dir` that batch scripts consume
 // programmatically: /B (bare names), /S (recurse, full paths), /A-D (files
 // only). It returns the matching entries and whether the args were a form it
