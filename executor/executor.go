@@ -31,16 +31,16 @@ type scriptFile struct {
 
 // Executor runs a list of statements with a program counter (for GOTO support).
 type Executor struct {
-	env        *env.Env
-	positional []string // %0, %1, ... script arguments
-	stmts      []parser.Statement // used by RunStmts (interactive / inline)
-	lines      []scriptLine       // used by RunFile (lazy parsing)
-	labelIdx   map[string]int     // label name → line index for O(1) GOTO
-	pc         int                // current line or statement index
-	gotoPending bool // true when GOTO was executed in a nested context
-	exitPending bool // true when EXIT /B was executed in a nested context
-	abortPending bool // true when the current batch file must terminate
-	                  // (missing CALL/GOTO label, malformed IF — cmd.exe aborts the script)
+	env          *env.Env
+	positional   []string           // %0, %1, ... script arguments
+	stmts        []parser.Statement // used by RunStmts (interactive / inline)
+	lines        []scriptLine       // used by RunFile (lazy parsing)
+	labelIdx     map[string]int     // label name → line index for O(1) GOTO
+	pc           int                // current line or statement index
+	gotoPending  bool               // true when GOTO was executed in a nested context
+	exitPending  bool               // true when EXIT /B was executed in a nested context
+	abortPending bool               // true when the current batch file must terminate
+	// (missing CALL/GOTO label, malformed IF — cmd.exe aborts the script)
 	activeForVars []string // FOR variables currently in scope (innermost last)
 }
 
@@ -205,7 +205,6 @@ func (ex *Executor) RunFile(path string, args []string) int {
 	fileCache[absPath] = &scriptFile{lines: slines, labelIdx: labelIdx}
 	return ex.runLines(slines, labelIdx, path, args)
 }
-
 
 func (ex *Executor) runLines(slines []scriptLine, labelIdx map[string]int, path string, args []string) int {
 	ex.env.FileMode = true
@@ -873,49 +872,49 @@ func (ex *Executor) execCall(s *parser.CallStatement) int {
 
 		if ex.lines != nil {
 			if idx, ok := ex.labelIdx[label]; ok {
-					ex.pc = idx + 1
-					code := 0
-					for ex.pc < len(ex.lines) {
-						sl := ex.lines[ex.pc]
-						ex.pc++
-						if sl.label != "" {
-							continue
-						}
-						expanded := expander.ExpandPercent(sl.raw, ex.env, ex.positional)
-		stmts, err := parser.ParseLineWithOpts(expanded, ex.env.DelayedExpansion)
-						if err != nil {
-							continue
-						}
-						done := false
-						for _, stmt := range stmts {
-							if exitStmt, ok := stmt.(*parser.ExitStatement); ok && exitStmt.SubOnly {
-								code = ex.execExit(exitStmt)
-								done = true
-								break
-							}
-							code = ex.execute(stmt)
-							if ex.shouldStop() {
-								break
-							}
-						}
-						if ex.abortPending {
-							// Missing label / malformed IF inside the subroutine:
-							// propagate so the whole file unwinds (cmd.exe).
+				ex.pc = idx + 1
+				code := 0
+				for ex.pc < len(ex.lines) {
+					sl := ex.lines[ex.pc]
+					ex.pc++
+					if sl.label != "" {
+						continue
+					}
+					expanded := expander.ExpandPercent(sl.raw, ex.env, ex.positional)
+					stmts, err := parser.ParseLineWithOpts(expanded, ex.env.DelayedExpansion)
+					if err != nil {
+						continue
+					}
+					done := false
+					for _, stmt := range stmts {
+						if exitStmt, ok := stmt.(*parser.ExitStatement); ok && exitStmt.SubOnly {
+							code = ex.execExit(exitStmt)
+							done = true
 							break
 						}
-						if done || ex.exitPending {
-							ex.exitPending = false
+						code = ex.execute(stmt)
+						if ex.shouldStop() {
 							break
-						}
-						if ex.gotoPending {
-							ex.gotoPending = false
-							continue
 						}
 					}
-					ex.pc = savedPC
-					ex.positional = savedPos
-					return code
+					if ex.abortPending {
+						// Missing label / malformed IF inside the subroutine:
+						// propagate so the whole file unwinds (cmd.exe).
+						break
+					}
+					if done || ex.exitPending {
+						ex.exitPending = false
+						break
+					}
+					if ex.gotoPending {
+						ex.gotoPending = false
+						continue
+					}
 				}
+				ex.pc = savedPC
+				ex.positional = savedPos
+				return code
+			}
 		} else {
 			for i, stmt := range ex.stmts {
 				if lbl, ok := stmt.(*parser.LabelStatement); ok && lbl.Name == label {
@@ -1238,17 +1237,17 @@ func (ex *Executor) execForInList(s *parser.ForStatement) int {
 // --- FOR /F ---
 
 type forFOpts struct {
-	tokens  []int  // token indices (1-based); -1 = wildcard (rest of line)
-	delims  string // delimiter characters
-	eol     byte   // end-of-line comment char
+	tokens   []int  // token indices (1-based); -1 = wildcard (rest of line)
+	delims   string // delimiter characters
+	eol      byte   // end-of-line comment char
 	usebackq bool
 }
 
 func parseForFOpts(optStr string) forFOpts {
 	opts := forFOpts{
-		tokens: []int{1},       // default: token 1
-		delims: " \t",          // default: space and tab
-		eol:    ';',            // default: semicolon
+		tokens: []int{1}, // default: token 1
+		delims: " \t",    // default: space and tab
+		eol:    ';',      // default: semicolon
 	}
 	optStr = strings.Trim(optStr, "\"")
 	// Custom split: keys are space-separated, but the value of `delims=`
@@ -1447,10 +1446,10 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 				data, err := os.ReadFile(filename)
 				if err == nil {
 					lines = strings.Split(strings.TrimRight(string(data), "\r\n"), "\n")
-				// Strip trailing \r on each line (CRLF line endings)
-				for i, ln := range lines {
-					lines[i] = strings.TrimRight(ln, "\r")
-				}
+					// Strip trailing \r on each line (CRLF line endings)
+					for i, ln := range lines {
+						lines[i] = strings.TrimRight(ln, "\r")
+					}
 				}
 			} else {
 				// "string" = parse the string directly

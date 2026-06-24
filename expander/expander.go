@@ -228,8 +228,8 @@ func expandDelayedRef(name string, e *env.Env) string {
 //   - VAR:~N,M  → substring
 //   - VAR:old=new → string replacement
 //   - VAR=       → cmd.exe quirk: value with one leading '=' stripped iff it
-//                  starts with '=', else empty. gw-batsic's char→hex table
-//                  relies on this to encode the '=' character.
+//     starts with '=', else empty. gw-batsic's char→hex table
+//     relies on this to encode the '=' character.
 //   - VAR        → plain lookup
 func resolveDelayedRef(name string, e *env.Env) string {
 	name = expandNestedPercents(name, e)
