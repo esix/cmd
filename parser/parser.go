@@ -808,8 +808,13 @@ func (p *parser) parseFor() (Statement, error) {
 
 	var items []string
 	if p.peek().Kind == lexer.LPAREN {
-		p.consume()
+		open := p.consume()
+		rawStart := open.Pos + len(open.Value)
 		for p.peek().Kind != lexer.RPAREN && p.peek().Kind != lexer.EOF {
+			if kind == ForTokens && p.raw != "" {
+				p.consume()
+				continue
+			}
 			tok := p.consume()
 			val := tok.Value
 			if tok.Kind == lexer.WORD || tok.Kind == lexer.PERCENT_VAR || tok.Kind == lexer.BANG_VAR {
@@ -822,7 +827,13 @@ func (p *parser) parseFor() (Statement, error) {
 			}
 		}
 		if p.peek().Kind == lexer.RPAREN {
-			p.consume()
+			close := p.consume()
+			if kind == ForTokens && p.raw != "" && rawStart <= close.Pos && close.Pos <= len(p.raw) {
+				source := strings.TrimSpace(p.raw[rawStart:close.Pos])
+				if source != "" {
+					items = []string{source}
+				}
+			}
 		}
 	}
 

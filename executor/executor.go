@@ -8,6 +8,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -121,15 +123,17 @@ var fileCache = map[string]*scriptFile{}
 // RunFile executes a .bat file. Lines are parsed on-the-fly so that
 // SETLOCAL EnableDelayedExpansion takes effect for subsequent lines.
 func (ex *Executor) RunFile(path string, args []string) int {
-	// Convert Windows backslash paths to Unix
-	path = strings.ReplaceAll(path, "\\", "/")
-	// Strip a drive-letter prefix (C:/foo → /foo) so Windows-style absolute
-	// paths in scripts resolve on Unix.
-	if len(path) >= 2 && path[1] == ':' &&
-		((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
-		path = path[2:]
-		if path == "" {
-			path = "/"
+	if runtime.GOOS != "windows" {
+		// Convert Windows backslash paths to Unix
+		path = strings.ReplaceAll(path, "\\", "/")
+		// Strip a drive-letter prefix (C:/foo → /foo) so Windows-style absolute
+		// paths in scripts resolve on Unix.
+		if len(path) >= 2 && path[1] == ':' &&
+			((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+			path = path[2:]
+			if path == "" {
+				path = "/"
+			}
 		}
 	}
 	// Resolve to absolute path for cache key
@@ -1369,6 +1373,21 @@ func splitByDelims(s, delims string) []string {
 	return strings.FieldsFunc(s, f)
 }
 
+func captureShellCommand(cmdStr string) ([]byte, error) {
+	if runtime.GOOS == "windows" {
+		shell := os.Getenv("COMSPEC")
+		if shell == "" {
+			root := os.Getenv("SystemRoot")
+			if root == "" {
+				root = `C:\Windows`
+			}
+			shell = filepath.Join(root, "System32", "cmd.exe")
+		}
+		return exec.Command(shell, "/S", "/C", cmdStr).Output()
+	}
+	return exec.Command("sh", "-c", cmdStr).Output()
+}
+
 // stripNulRedirect removes a trailing Windows null redirect (`2>nul`, `>nul`)
 // from a command string so it isn't passed to sh (which would create a file).
 func stripNulRedirect(cmd string) string {
@@ -1396,6 +1415,33 @@ func runDirCommand(cmdStr string) (string, bool) {
 	return strings.Join(lines, "\n"), true
 }
 
+func runSortCommand(cmdStr string) (string, bool) {
+	fields := splitArgs(cmdStr)
+	if len(fields) == 0 || strings.ToLower(fields[0]) != "sort" {
+		return "", false
+	}
+
+	var lines []string
+	for _, arg := range fields[1:] {
+		if strings.HasPrefix(arg, "/") {
+			continue
+		}
+		name := stripOuterQuotes(arg)
+		if runtime.GOOS != "windows" {
+			name = strings.ReplaceAll(name, "\\", "/")
+		}
+		data, err := os.ReadFile(name)
+		if err != nil {
+			return "", true
+		}
+		for _, line := range strings.Split(strings.TrimRight(string(data), "\r\n"), "\n") {
+			lines = append(lines, strings.TrimRight(line, "\r"))
+		}
+	}
+	sort.Strings(lines)
+	return strings.Join(lines, "\n"), true
+}
+
 func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 	opts := parseForFOpts(s.Options)
 
@@ -1418,9 +1464,13 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 			cmdStr = stripNulRedirect(cmdStr)
 			// Convert Windows path separators (\) to / so sh doesn't treat
 			// them as escape sequences (e.g. `sort "%TEMP%\file"`).
-			cmdStr = strings.ReplaceAll(cmdStr, "\\", "/")
+			if runtime.GOOS != "windows" {
+				cmdStr = strings.ReplaceAll(cmdStr, "\\", "/")
+			}
 			// Handle Windows `dir` internally; sh has no such command.
 			if out, ok := runDirCommand(cmdStr); ok {
+				lines = strings.Split(strings.TrimRight(out, "\r\n"), "\n")
+			} else if out, ok := runSortCommand(cmdStr); ok {
 				lines = strings.Split(strings.TrimRight(out, "\r\n"), "\n")
 			} else if out, ok := ex.runInternalCapture(cmdStr); ok {
 				// Internal commands — notably `set <prefix>` enumeration —
@@ -1428,7 +1478,7 @@ func (ex *Executor) execForTokens(s *parser.ForStatement) int {
 				// different builtin and would capture nothing.
 				lines = strings.Split(strings.TrimRight(out, "\r\n"), "\n")
 			} else {
-				out, err := exec.Command("sh", "-c", cmdStr).Output()
+				out, err := captureShellCommand(cmdStr)
 				if err == nil {
 					lines = strings.Split(strings.TrimRight(string(out), "\r\n"), "\n")
 				}
@@ -1782,14 +1832,16 @@ func joinBlocks(lines []scriptLine) []scriptLine {
 // resolveBat checks if name refers to a .bat file (with or without extension).
 // Returns the resolved path and true if found.
 func (ex *Executor) resolveBat(name string) (string, bool) {
-	name = strings.ReplaceAll(name, "\\", "/")
-	// Strip a drive-letter prefix (C:/foo → /foo) like RunFile does, so
-	// extension probing works for Windows-style absolute paths.
-	if len(name) >= 2 && name[1] == ':' &&
-		((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z')) {
-		name = name[2:]
-		if name == "" {
-			name = "/"
+	if runtime.GOOS != "windows" {
+		name = strings.ReplaceAll(name, "\\", "/")
+		// Strip a drive-letter prefix (C:/foo → /foo) like RunFile does, so
+		// extension probing works for Windows-style absolute paths.
+		if len(name) >= 2 && name[1] == ':' &&
+			((name[0] >= 'A' && name[0] <= 'Z') || (name[0] >= 'a' && name[0] <= 'z')) {
+			name = name[2:]
+			if name == "" {
+				name = "/"
+			}
 		}
 	}
 	lower := strings.ToLower(name)
@@ -1816,10 +1868,14 @@ func (ex *Executor) resolveBat(name string) (string, bool) {
 		pathEnv = os.Getenv("PATH")
 	}
 	// BAT uses ; as PATH separator, Unix uses : — support both
-	pathEnv = strings.ReplaceAll(pathEnv, ";", string(filepath.ListSeparator))
+	if runtime.GOOS != "windows" {
+		pathEnv = strings.ReplaceAll(pathEnv, ";", string(filepath.ListSeparator))
+	}
 	for _, dir := range filepath.SplitList(pathEnv) {
 		// Convert Windows-style backslashes to forward slashes for OS calls
-		dir = strings.ReplaceAll(dir, "\\", "/")
+		if runtime.GOOS != "windows" {
+			dir = strings.ReplaceAll(dir, "\\", "/")
+		}
 		for _, c := range candidates {
 			full := filepath.Join(dir, c)
 			if _, err := os.Stat(full); err == nil {

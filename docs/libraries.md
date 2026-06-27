@@ -54,7 +54,8 @@ rl, err := readline.NewEx(&readline.Config{
 })
 ```
 
-The history file is `$HOME/.batsh_history` ([repl/repl.go:18](../repl/repl.go)).
+The history file is the user's home-directory `.cmd_history`
+([repl/repl.go:18](../repl/repl.go)).
 The read loop maps `readline`'s two sentinel errors onto cmd.exe semantics
 ([repl/repl.go:36](../repl/repl.go)):
 

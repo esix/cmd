@@ -1,6 +1,7 @@
 package parser
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -119,6 +120,45 @@ func TestParseFor(t *testing.T) {
 	}
 	if len(f.InList) != 3 {
 		t.Errorf("InList = %v, want 3 items", f.InList)
+	}
+}
+
+func TestParseForFBackquotedCommand(t *testing.T) {
+	stmts, err := ParseLine("for /f \"usebackq tokens=1,* delims= \" %%a in (`sort \"C:\\temp\\program.dat\"`) do echo %%a %%b")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := stmts[0].(*ForStatement)
+	got := strings.Join(f.InList, " ")
+	want := "`sort \"C:\\temp\\program.dat\"`"
+	if got != want {
+		t.Fatalf("source = %q, want %q (items=%#v)", got, want, f.InList)
+	}
+}
+
+func TestParseForFBackquotedCommandPreservesDelayedVarInQuotes(t *testing.T) {
+	stmts, err := ParseLineWithOpts("for /f \"usebackq tokens=1,* delims= \" %%a in (`sort \"!_pf!\"`) do echo %%a %%b", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := stmts[0].(*ForStatement)
+	got := strings.Join(f.InList, " ")
+	want := "`sort \"!_pf!\"`"
+	if got != want {
+		t.Fatalf("source = %q, want %q (items=%#v)", got, want, f.InList)
+	}
+}
+
+func TestParseForFBackquotedCommandWithBlockBody(t *testing.T) {
+	stmts, err := ParseLine("for /f \"usebackq tokens=1,* delims= \" %%a in (`sort \"C:\\temp\\program.dat\"`) do ( echo %%a %%b )")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := stmts[0].(*ForStatement)
+	got := strings.Join(f.InList, " ")
+	want := "`sort \"C:\\temp\\program.dat\"`"
+	if got != want {
+		t.Fatalf("source = %q, want %q (items=%#v)", got, want, f.InList)
 	}
 }
 

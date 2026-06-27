@@ -113,22 +113,12 @@ func applyTildeMods(val, modifiers string) string {
 	// d = drive (on Unix, "/" for an absolute path).
 	if strings.Contains(mods, "d") {
 		recognized = true
-		if filepath.IsAbs(absPath) {
-			result += "/"
-		}
+		result += tildeDrivePart(absPath)
 	}
 	// p = directory part of the absolute path.
 	if strings.Contains(mods, "p") {
 		recognized = true
-		dir := filepath.Dir(absPath)
-		// If d already added "/", don't double the leading slash.
-		if strings.Contains(mods, "d") && strings.HasPrefix(dir, "/") {
-			dir = strings.TrimPrefix(dir, "/")
-		}
-		result += dir
-		if !strings.HasSuffix(result, "/") {
-			result += "/"
-		}
+		result += tildePathPart(absPath, strings.Contains(mods, "d"))
 	}
 	// n = file name without extension.
 	if strings.Contains(mods, "n") {
@@ -157,6 +147,31 @@ func applyTildeMods(val, modifiers string) string {
 		return stripQuotes(val)
 	}
 	return result
+}
+
+func tildeDrivePart(absPath string) string {
+	if vol := filepath.VolumeName(absPath); vol != "" {
+		return vol
+	}
+	if filepath.IsAbs(absPath) {
+		return "/"
+	}
+	return ""
+}
+
+func tildePathPart(absPath string, driveIncluded bool) string {
+	dir := filepath.Dir(absPath)
+	if driveIncluded {
+		if vol := filepath.VolumeName(dir); vol != "" {
+			dir = strings.TrimPrefix(dir, vol)
+		} else if strings.HasPrefix(dir, "/") {
+			dir = strings.TrimPrefix(dir, "/")
+		}
+	}
+	if dir != "" && !strings.HasSuffix(dir, string(filepath.Separator)) {
+		dir += string(filepath.Separator)
+	}
+	return dir
 }
 
 // fileAttrString builds a cmd.exe-style 9-char attribute string. Unix lacks

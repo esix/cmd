@@ -161,21 +161,10 @@ func tildeExpand(digit int, mods string, positional []string) string {
 	}
 
 	if strings.Contains(mods, "d") {
-		if filepath.IsAbs(absPath) {
-			result += "/"
-		}
+		result += tildeDrivePart(absPath)
 	}
 	if strings.Contains(mods, "p") {
-		dir := filepath.Dir(absPath)
-		// Avoid duplicating leading slash from "d"
-		if strings.Contains(mods, "d") && strings.HasPrefix(dir, "/") {
-			dir = strings.TrimPrefix(dir, "/")
-		}
-		// A root-level file leaves dir empty after the strip; the "d" part
-		// already supplied the "/" (avoids "%~dp1" of /file → "//").
-		if dir != "" && !strings.HasSuffix(dir, "/") {
-			dir += "/"
-		}
+		dir := tildePathPart(absPath, strings.Contains(mods, "d"))
 		result += dir
 	}
 	if strings.Contains(mods, "n") {

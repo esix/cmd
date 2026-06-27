@@ -15,14 +15,18 @@ import (
 
 // Run starts the interactive shell loop.
 func Run(e *env.Env) {
-	histFile := filepath.Join(os.Getenv("HOME"), ".batsh_history")
+	histFile := ""
+	if home, err := os.UserHomeDir(); err == nil && home != "" {
+		histFile = filepath.Join(home, ".cmd_history")
+	}
 
 	rl, err := readline.NewEx(&readline.Config{
-		Prompt:          "C:\\> ",
-		HistoryFile:     histFile,
-		AutoComplete:    newCompleter(),
-		InterruptPrompt: "^C",
-		EOFPrompt:       "exit",
+		Prompt:              "C:\\> ",
+		HistoryFile:         histFile,
+		AutoComplete:        newCompleter(),
+		InterruptPrompt:     "^C",
+		EOFPrompt:           "exit",
+		FuncFilterInputRune: filterInputRune,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "readline init error: %v\n", err)

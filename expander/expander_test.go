@@ -1,6 +1,9 @@
 package expander
 
 import (
+	"path/filepath"
+	"runtime"
+	"strings"
 	"testing"
 
 	"github.com/esix/cmd/env"
@@ -140,6 +143,26 @@ func TestEarlyExpandTilde(t *testing.T) {
 	got := ExpandPercent("echo %~1", e, pos)
 	if got != "echo quoted" {
 		t.Errorf("got %q, want %q", got, "echo quoted")
+	}
+}
+
+func TestEarlyExpandTildeDP0UsesNativeWindowsDrive(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows drive-letter regression test")
+	}
+
+	e := env.New()
+	script, err := filepath.Abs(`gw-batsic.bat`)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got := ExpandPercent("call %~dp0src\\lexer\\keyword", e, []string{script})
+	if strings.Contains(got, "/"+filepath.VolumeName(script)) {
+		t.Fatalf("expanded path has Unix-prefixed drive: %q", got)
+	}
+	if !strings.Contains(got, filepath.VolumeName(script)+`\`) {
+		t.Fatalf("expanded path does not contain native drive path: %q", got)
 	}
 }
 

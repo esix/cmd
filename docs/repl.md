@@ -100,7 +100,10 @@ read-eval loop.
 ### readline configuration
 
 ```go
-histFile := filepath.Join(os.Getenv("HOME"), ".batsh_history")
+histFile := ""
+if home, err := os.UserHomeDir(); err == nil && home != "" {
+    histFile = filepath.Join(home, ".cmd_history")
+}
 
 rl, err := readline.NewEx(&readline.Config{
     Prompt:          "C:\\> ",
@@ -114,11 +117,10 @@ rl, err := readline.NewEx(&readline.Config{
 - **Prompt** is the fixed literal `C:\> ` (`Prompt: "C:\\> "`). It is *not*
   derived from `%PROMPT%`, the current directory, or any env var — it never
   changes during the session.
-- **History file** is `$HOME/.batsh_history` (`repl/repl.go:18`), read via
-  `os.Getenv("HOME")` (not `os.UserHomeDir`). readline loads prior history from
-  it on startup and appends accepted lines, persisting command history across
-  `cmd` invocations. If `$HOME` is empty the path degrades to `.batsh_history`
-  in the cwd.
+- **History file** is `.cmd_history` in `os.UserHomeDir()` (`repl/repl.go:18`).
+  readline loads prior history from it on startup and appends accepted lines,
+  persisting command history across `cmd` invocations. If the home directory
+  cannot be resolved, no history file is configured.
 - **AutoComplete** is the prefix completer from `newCompleter()` —
   see [Tab completion](#tab-completion-completergo).
 - **InterruptPrompt** / **EOFPrompt** are readline's display strings for Ctrl-C
